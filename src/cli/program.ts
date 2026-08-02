@@ -8,17 +8,25 @@ import { registerConfigCommand } from "./commands/config.command.js";
 import type { DoctorRunner } from "../application/doctor/doctor-types.js";
 import { DoctorService } from "../application/doctor/doctor-service.js";
 import { registerDoctorCommand } from "./commands/doctor.command.js";
+import type { ProjectManager } from "../application/projects/project-service.js";
+import { ProjectService } from "../application/projects/project-service.js";
+import { ProjectFileRepository } from "../infrastructure/persistence/project-file-repository.js";
+import { registerProjectCommands } from "./commands/project.command.js";
 
 export type ProgramDependencies = {
   output?: OutputWriter;
   configService?: ConfigService;
   doctorService?: DoctorRunner;
+  projectService?: ProjectManager;
 };
 
 export function createProgram(dependencies: ProgramDependencies = {}): Command {
   const output = dependencies.output ?? consoleOutput;
   const configService = dependencies.configService ?? new ConfigService();
   const doctorService = dependencies.doctorService ?? new DoctorService(configService);
+  const projectService =
+    dependencies.projectService ??
+    new ProjectService(new ProjectFileRepository(configService.paths));
   const program = new Command();
 
   program
@@ -41,6 +49,7 @@ export function createProgram(dependencies: ProgramDependencies = {}): Command {
 
   registerConfigCommand(program, configService, output);
   registerDoctorCommand(program, doctorService, output);
+  registerProjectCommands(program, projectService, configService, output);
 
   return program;
 }
