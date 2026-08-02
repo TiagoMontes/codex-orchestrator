@@ -1,4 +1,5 @@
 import type { Command } from "commander";
+import { join } from "node:path";
 import type { ConfigService } from "../../application/configuration/config-service.js";
 import type { ProjectManager } from "../../application/projects/project-service.js";
 import type { Project } from "../../domain/project/project.js";
@@ -66,7 +67,12 @@ export function registerProjectCommands(
     .action(async (reference: string) => {
       await config.load();
       const found = await projects.inspect(reference);
-      emitProject(program, output, found, formatProject(found));
+      emitProject(
+        program,
+        output,
+        found,
+        formatProject(found, join(config.paths.projectDirectory(found.id), "project-config.yaml")),
+      );
     });
 
   project
@@ -195,7 +201,7 @@ function emitProject(
   writeResult(output, isJson(program) ? project : human, isJson(program));
 }
 
-function formatProject(project: Project): string {
+function formatProject(project: Project, projectConfigPath: string): string {
   return [
     `Project: ${project.id} (${project.name})`,
     `Repository: ${project.gitRoot}`,
@@ -203,6 +209,12 @@ function formatProject(project: Project): string {
     `Stack: ${project.detectedStack.languages.join(", ") || "unknown"}`,
     `Instructions: ${project.instructionFiles.length}`,
     `Skills: ${project.skillMetadata.length}`,
+    `Project config: ${projectConfigPath}`,
+    `Approved verification commands: ${
+      [...project.verificationPolicy.focused, ...project.verificationPolicy.full].filter(
+        (command) => command.approved,
+      ).length
+    }`,
     `Verification candidates: ${project.verificationPolicy.candidates.length}`,
   ].join("\n");
 }

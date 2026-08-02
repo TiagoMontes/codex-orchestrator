@@ -2,10 +2,10 @@ import { z } from "zod";
 
 export const verificationCommandSchema = z
   .object({
-    name: z.string().min(1),
-    argv: z.array(z.string()).min(1),
-    timeoutSeconds: z.number().int().positive(),
-    source: z.string().min(1),
+    name: z.string().min(1).max(200),
+    argv: z.array(z.string().min(1).max(4_096)).min(1).max(64),
+    timeoutSeconds: z.number().int().positive().max(3_600),
+    source: z.string().min(1).max(500),
     approved: z.boolean(),
   })
   .strict();
@@ -15,6 +15,44 @@ export const verificationPolicySchema = z
     focused: z.array(verificationCommandSchema),
     full: z.array(verificationCommandSchema),
     candidates: z.array(verificationCommandSchema),
+  })
+  .strict();
+
+const projectVerificationCommandConfigSchema = z
+  .object({
+    name: z.string().min(1).max(200),
+    command: z.array(z.string().min(1).max(4_096)).min(1).max(64).optional(),
+    argv: z.array(z.string().min(1).max(4_096)).min(1).max(64).optional(),
+    timeoutSeconds: z.number().int().positive().max(3_600),
+    source: z.string().min(1).max(500).default("project-config.yaml"),
+    approved: z.boolean().default(false),
+  })
+  .strict()
+  .superRefine((value, context) => {
+    if ((value.command === undefined) === (value.argv === undefined)) {
+      context.addIssue({
+        code: "custom",
+        message: "Specify exactly one of command or argv",
+        path: ["command"],
+      });
+    }
+  })
+  .transform(({ command, argv, ...value }) => ({
+    ...value,
+    argv: command ?? argv ?? [],
+  }));
+
+export const projectConfigSchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    projectId: z.string().min(1),
+    verification: z
+      .object({
+        focused: z.array(projectVerificationCommandConfigSchema),
+        full: z.array(projectVerificationCommandConfigSchema),
+        candidates: z.array(projectVerificationCommandConfigSchema),
+      })
+      .strict(),
   })
   .strict();
 
@@ -94,3 +132,4 @@ export type InstructionFileReference = z.infer<typeof instructionFileReferenceSc
 export type SkillMetadata = z.infer<typeof skillMetadataSchema>;
 export type VerificationCommand = z.infer<typeof verificationCommandSchema>;
 export type VerificationPolicy = z.infer<typeof verificationPolicySchema>;
+export type ProjectConfig = z.output<typeof projectConfigSchema>;

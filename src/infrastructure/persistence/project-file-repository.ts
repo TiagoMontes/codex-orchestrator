@@ -1,14 +1,17 @@
-import { access, constants, rm } from "node:fs/promises";
+import { access, constants, readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
-import { stringify } from "yaml";
+import { parse, stringify } from "yaml";
 import type { Clock } from "../../shared/clock.js";
 import { isoNow, systemClock } from "../../shared/clock.js";
 import { OrchestratorError } from "../../shared/errors.js";
 import {
   projectIndexSchema,
+  projectConfigSchema,
   projectSchema,
   type Project,
+  type ProjectConfig,
   type ProjectIndex,
+  type VerificationCommand,
 } from "../../domain/project/project.js";
 import { AtomicFileWriter } from "./atomic-file-writer.js";
 import { AtomicJsonStore } from "./atomic-json-store.js";
@@ -57,15 +60,18 @@ export class ProjectFileRepository {
         });
       }
       await this.paths.ensureBaseDirectories();
-      await this.store.write(this.projectFile(project.id), projectSchema.parse(project));
-      await this.textWriter.writeText(
-        join(this.paths.projectDirectory(project.id), "project-config.yaml"),
-        stringify({
-          schemaVersion: 1,
-          projectId: project.id,
-          verification: project.verificationPolicy,
-        }),
-      );
+      const configPath = this.projectConfigFile(project.id);
+      const configExists = await exists(configPath);
+      const persisted = configExists
+        ? {
+            ...project,
+            verificationPolicy: (await this.readConfig(configPath, project.id)).verification,
+          }
+        : project;
+      if (!configExists) {
+        await this.textWriter.writeText(configPath, stringify(toProjectConfig(project)));
+      }
+      await this.store.write(this.projectFile(project.id), projectSchema.parse(persisted));
       if (!index.projectIds.includes(project.id)) {
         index.projectIds.push(project.id);
         index.projectIds.sort();
@@ -93,11 +99,43 @@ export class ProjectFileRepository {
   }
 
   private async getById(id: string): Promise<Project> {
-    return this.store.read(this.projectFile(id), projectSchema);
+    const project = await this.store.read(this.projectFile(id), projectSchema);
+    const config = await this.readConfig(this.projectConfigFile(id), id);
+    return projectSchema.parse({ ...project, verificationPolicy: config.verification });
   }
 
   private projectFile(id: string): string {
     return join(this.paths.projectDirectory(id), "project.json");
+  }
+
+  private projectConfigFile(id: string): string {
+    return join(this.paths.projectDirectory(id), "project-config.yaml");
+  }
+
+  private async readConfig(path: string, projectId: string): Promise<ProjectConfig> {
+    let input: unknown;
+    try {
+      input = parse(await readFile(path, "utf8")) as unknown;
+    } catch (error) {
+      throw new OrchestratorError(`Project configuration is not valid YAML: ${path}`, {
+        code: "CONFIGURATION",
+        cause: error,
+      });
+    }
+    const result = projectConfigSchema.safeParse(input);
+    if (!result.success) {
+      throw new OrchestratorError(`Project configuration failed validation: ${path}`, {
+        code: "CONFIGURATION",
+        cause: result.error,
+      });
+    }
+    if (result.data.projectId !== projectId) {
+      throw new OrchestratorError(
+        `Project configuration identity mismatch: expected ${projectId}, received ${result.data.projectId}`,
+        { code: "CONFIGURATION" },
+      );
+    }
+    return result.data;
   }
 
   private async readIndex(): Promise<ProjectIndex> {
@@ -110,6 +148,25 @@ export class ProjectFileRepository {
   private async listFromIndex(index: ProjectIndex): Promise<Project[]> {
     return Promise.all(index.projectIds.map(async (id) => this.getById(id)));
   }
+}
+
+function toProjectConfig(project: Project): Record<string, unknown> {
+  const configured = (command: VerificationCommand): Record<string, unknown> => ({
+    name: command.name,
+    command: command.argv,
+    timeoutSeconds: command.timeoutSeconds,
+    source: command.source,
+    approved: command.approved,
+  });
+  return {
+    schemaVersion: 1,
+    projectId: project.id,
+    verification: {
+      focused: project.verificationPolicy.focused.map(configured),
+      full: project.verificationPolicy.full.map(configured),
+      candidates: project.verificationPolicy.candidates.map(configured),
+    },
+  };
 }
 
 async function exists(path: string): Promise<boolean> {

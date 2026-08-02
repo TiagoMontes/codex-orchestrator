@@ -1,11 +1,13 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { ProjectService } from "../../src/application/projects/project-service.js";
+import { ProjectRefreshService } from "../../src/application/auditing/project-refresh-service.js";
 import { DeterministicTaskNormalizer } from "../../src/application/tasks/deterministic-task-normalizer.js";
 import { TaskService } from "../../src/application/tasks/task-service.js";
 import { ProjectFileRepository } from "../../src/infrastructure/persistence/project-file-repository.js";
+import { AuditArtifactRepository } from "../../src/infrastructure/persistence/audit-artifact-repository.js";
 import { FileLockManager } from "../../src/infrastructure/persistence/file-lock.js";
 import { StatePaths } from "../../src/infrastructure/persistence/state-paths.js";
 import { TaskFileRepository } from "../../src/infrastructure/persistence/task-file-repository.js";
@@ -62,6 +64,85 @@ describe("project registration", () => {
       schemaVersion: 1,
       id: "demo",
     });
+    const projectConfig = await readFile(
+      join(stateHome, "projects", "demo", "project-config.yaml"),
+      "utf8",
+    );
+    expect(projectConfig).toContain("command:");
+    expect(projectConfig).not.toContain("argv:");
+  });
+
+  it("loads explicit verification policy and preserves it across project refresh", async () => {
+    const fixture = await mkdtemp(join(tmpdir(), "cxo-project-policy-fixture-"));
+    const stateHome = await mkdtemp(join(tmpdir(), "cxo-project-policy-state-"));
+    temporaryDirectories.push(fixture, stateHome);
+    await createGitFixture(fixture);
+    const paths = new StatePaths({ CODEX_ORCHESTRATOR_HOME: stateHome });
+    const repository = new ProjectFileRepository(paths);
+    const service = new ProjectService(repository);
+    await service.add({ path: fixture, name: "demo" });
+    const configPath = join(stateHome, "projects", "demo", "project-config.yaml");
+    const explicitConfig = `schemaVersion: 1
+projectId: demo
+verification:
+  focused:
+    - name: focused-node-test
+      command: [node, --test, test/index.test.js]
+      timeoutSeconds: 90
+      source: user-configured
+      approved: true
+  full: []
+  candidates: []
+`;
+    await writeFile(configPath, explicitConfig, "utf8");
+
+    await expect(service.inspect("demo")).resolves.toMatchObject({
+      verificationPolicy: {
+        focused: [
+          {
+            name: "focused-node-test",
+            argv: ["node", "--test", "test/index.test.js"],
+            approved: true,
+          },
+        ],
+      },
+    });
+
+    const report = await new ProjectRefreshService(
+      service,
+      repository,
+      new AuditArtifactRepository(paths),
+    ).refresh("demo");
+
+    expect(report.project.verificationPolicy.focused[0]).toMatchObject({
+      argv: ["node", "--test", "test/index.test.js"],
+      approved: true,
+    });
+    expect(await readFile(configPath, "utf8")).toBe(explicitConfig);
+  });
+
+  it("rejects a project configuration bound to another project", async () => {
+    const fixture = await mkdtemp(join(tmpdir(), "cxo-project-config-id-fixture-"));
+    const stateHome = await mkdtemp(join(tmpdir(), "cxo-project-config-id-state-"));
+    temporaryDirectories.push(fixture, stateHome);
+    await createGitFixture(fixture);
+    const paths = new StatePaths({ CODEX_ORCHESTRATOR_HOME: stateHome });
+    const service = new ProjectService(new ProjectFileRepository(paths));
+    await service.add({ path: fixture, name: "demo" });
+    await writeFile(
+      join(stateHome, "projects", "demo", "project-config.yaml"),
+      `schemaVersion: 1
+projectId: other-project
+verification:
+  focused: []
+  full: []
+  candidates: []
+`,
+      "utf8",
+    );
+
+    await expect(service.inspect("demo")).rejects.toMatchObject({ code: "CONFIGURATION" });
+    await expect(service.inspect("demo")).rejects.toThrow("identity mismatch");
   });
 
   it("removes orchestrator state without deleting the target repository", async () => {

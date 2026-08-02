@@ -73,6 +73,12 @@ cxo task status BUG-2026-0001
 cxo task logs BUG-2026-0001 --tail 100
 ```
 
+`project inspect` prints the state-owned `project-config.yaml` path. Its verification commands use
+literal `command` argument arrays, timeouts, and an explicit `approved` flag. Generated candidates
+stay disabled; inspect and approve only commands you trust. The file is strictly validated on every
+project lookup, and `project refresh` preserves user edits while refreshing detected metadata. See
+[`templates/project.config.example.yaml`](templates/project.config.example.yaml).
+
 `task run` creates a state-owned worktree and task branch at the diagnosed commit. Codex may write
 only there. The primary checkout's HEAD, status, and contents are checked throughout the workflow.
 Verification runs approved literal argv outside the model; review starts a new thread and is bound to
@@ -259,9 +265,10 @@ context pack.
 
 - The MVP prepares changes but does not merge, push, open pull requests, or commit task worktree
   changes.
-- Automatic verification approval is deliberately narrow: the detector approves exact `node
---test`; PHP, Python, Rust, Go, alternate Node commands, and dependency installation remain
-  unapproved candidates until a supported project policy is configured in a future release.
+- Automatic verification approval is deliberately narrow: the detector approves the exact command
+  `node --test`. PHP, Python, Rust, Go, and alternate Node commands remain disabled candidates until the
+  user explicitly approves literal argument arrays in the state-owned project configuration.
+  Dependency installation is never automatic.
 - Verification uses an allowlisted literal argv and sanitized environment, but the host OS—not the
   CLI—determines process-level network isolation.
 - Project audits require a clean checkout and inventory at most 5,000 tracked files. They are

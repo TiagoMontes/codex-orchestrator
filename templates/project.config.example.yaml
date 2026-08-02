@@ -1,0 +1,24 @@
+# Copy the relevant entries into the state-owned project-config.yaml path printed by:
+# cxo project inspect <project>
+#
+# Commands are literal argument arrays. They are never interpolated through a shell.
+# Generated candidates remain disabled until you inspect them and set approved: true.
+schemaVersion: 1
+projectId: replace-with-registered-project-id
+
+verification:
+  focused:
+    - name: focused-tests
+      command: [node, --test, test/example.test.js]
+      timeoutSeconds: 180
+      source: user-configured
+      approved: false
+
+  full:
+    - name: test-suite
+      command: [node, --test]
+      timeoutSeconds: 600
+      source: user-configured
+      approved: false
+
+  candidates: []

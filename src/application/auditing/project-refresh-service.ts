@@ -62,7 +62,7 @@ export class ProjectRefreshService implements ProjectRefresher {
         code: "CONTEXT_INTEGRITY",
       });
     }
-    const project: Project = {
+    const detectedProject: Project = {
       ...existing,
       repositoryPath: gitMetadata.repositoryPath,
       gitRoot: gitMetadata.gitRoot,
@@ -80,7 +80,8 @@ export class ProjectRefreshService implements ProjectRefresher {
       skillMetadata: metadata.skillMetadata,
       updatedAt: isoNow(this.clock),
     };
-    await this.projectRepository.save(project);
+    await this.projectRepository.save(detectedProject);
+    const project = await this.projects.inspect(detectedProject.id);
     const generation = await this.artifacts.readOptional(project.id);
     if (generation === undefined) return { project };
     const changedFiles =

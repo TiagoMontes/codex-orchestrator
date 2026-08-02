@@ -39,6 +39,14 @@ If the requested reasoning effort is unsupported, the adapter tries one configur
 failure is reported as exit 6; change the model/reasoning configuration or pass a supported explicit
 override.
 
+## No verification command is approved
+
+Run `cxo project inspect <project>` and open the printed state-owned `project-config.yaml`. Move or
+add the intended literal `command` array under `focused` or `full`, inspect it, and set
+`approved: true`. The schema also requires a positive timeout and the matching project ID. Commands
+under `candidates` are discovery hints and are never executed. `project refresh` redetects stack
+metadata without overwriting this policy. The CLI never installs dependencies for verification.
+
 ## Task is blocked
 
 Read the latest transition, attempts, decisions, verification, and safe next command:
