@@ -107,6 +107,7 @@ export const appConfigSchema = z
     parallelism: z
       .object({
         enabled: z.boolean(),
+        maxParallelReaders: z.number().int().nonnegative(),
         maxDepth: z.literal(1),
         allowNestedAgents: z.literal(false),
         readOnlyOnly: z.literal(true),

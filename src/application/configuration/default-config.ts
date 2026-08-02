@@ -96,6 +96,7 @@ export const DEFAULT_CONFIG: AppConfig = {
   },
   parallelism: {
     enabled: true,
+    maxParallelReaders: 2,
     maxDepth: 1,
     allowNestedAgents: false,
     readOnlyOnly: true,
