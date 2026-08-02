@@ -5,15 +5,20 @@ import { consoleOutput } from "./output.js";
 import { OrchestratorError } from "../shared/errors.js";
 import { ConfigService } from "../application/configuration/config-service.js";
 import { registerConfigCommand } from "./commands/config.command.js";
+import type { DoctorRunner } from "../application/doctor/doctor-types.js";
+import { DoctorService } from "../application/doctor/doctor-service.js";
+import { registerDoctorCommand } from "./commands/doctor.command.js";
 
 export type ProgramDependencies = {
   output?: OutputWriter;
   configService?: ConfigService;
+  doctorService?: DoctorRunner;
 };
 
 export function createProgram(dependencies: ProgramDependencies = {}): Command {
   const output = dependencies.output ?? consoleOutput;
   const configService = dependencies.configService ?? new ConfigService();
+  const doctorService = dependencies.doctorService ?? new DoctorService(configService);
   const program = new Command();
 
   program
@@ -35,6 +40,7 @@ export function createProgram(dependencies: ProgramDependencies = {}): Command {
     });
 
   registerConfigCommand(program, configService, output);
+  registerDoctorCommand(program, doctorService, output);
 
   return program;
 }
