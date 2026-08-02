@@ -8,7 +8,7 @@ import type { StatePaths } from "./state-paths.js";
 import { AtomicJsonStore } from "./atomic-json-store.js";
 import { FileLockManager } from "./file-lock.js";
 
-const decisionEntrySchema = z
+export const decisionEntrySchema = z
   .object({
     id: z.string().uuid(),
     kind: z.enum(["model-routing", "network-opt-in", "reasoning-fallback", "escalation", "human"]),
@@ -18,7 +18,7 @@ const decisionEntrySchema = z
   })
   .strict();
 
-const decisionDocumentSchema = z
+export const decisionDocumentSchema = z
   .object({
     schemaVersion: z.literal(1),
     taskId: z.string(),
@@ -65,10 +65,18 @@ export class DecisionFileRepository {
     }
   }
 
+  async list(projectId: string, taskId: string): Promise<DecisionEntry[]> {
+    const path = this.path(projectId, taskId);
+    if (!(await exists(path))) return [];
+    return (await this.store.read(path, decisionDocumentSchema)).entries;
+  }
+
   private path(projectId: string, taskId: string): string {
     return join(this.paths.taskDirectory(projectId, taskId), "decisions.json");
   }
 }
+
+export type DecisionEntry = z.infer<typeof decisionEntrySchema>;
 
 async function exists(path: string): Promise<boolean> {
   try {

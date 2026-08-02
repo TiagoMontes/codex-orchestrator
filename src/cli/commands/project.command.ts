@@ -14,6 +14,7 @@ import {
   reasoningPresetSchema,
 } from "../../application/configuration/config-schema.js";
 import { OrchestratorError } from "../../shared/errors.js";
+import { parseCliValue } from "../validation.js";
 
 export function registerProjectCommands(
   program: Command,
@@ -137,11 +138,11 @@ function parseAuditOverrides(
 ): ProjectAuditOverrides {
   return {
     ...(typeof options.profile === "string"
-      ? { profile: executionProfileSchema.parse(options.profile) }
+      ? { profile: parseCliValue(executionProfileSchema, options.profile, "--profile") }
       : {}),
     ...(typeof options.model === "string" ? { model: options.model } : {}),
     ...(typeof options.reasoning === "string"
-      ? { reasoning: reasoningPresetSchema.parse(options.reasoning) }
+      ? { reasoning: parseCliValue(reasoningPresetSchema, options.reasoning, "--reasoning") }
       : {}),
     ...(typeof options.maxTotalTokens === "string"
       ? { maxTotalTokens: positiveInteger(options.maxTotalTokens, "max-total-tokens") }

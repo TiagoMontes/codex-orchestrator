@@ -149,6 +149,14 @@ export class TaskWorktreeService {
       return { task, worktree };
     } catch (error) {
       const normalized = toOrchestratorError(error);
+      const persistedState = await this.tasks.getState(taskId);
+      if (persistedState.status === "cancelled") {
+        throw new OrchestratorError("Task worktree preparation was cancelled", {
+          code: "CANCELLED",
+          resumable: true,
+          cause: error,
+        });
+      }
       if (state.status === "worktree-preparing") {
         const blockedAt = isoNow(this.clock);
         state = this.stateMachine.transition(state, {

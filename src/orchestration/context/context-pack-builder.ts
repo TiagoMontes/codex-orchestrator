@@ -26,7 +26,14 @@ export type ContextPackInput = {
   diffHash?: string;
   diffPatch?: string;
   verification?: unknown;
-  selectedSkills?: ReadonlyArray<{ name: string; sha256: string }>;
+  selectedSkills?: ReadonlyArray<{
+    name: string;
+    sha256: string;
+    source: "bundled" | "project" | "user";
+    path: string;
+    instructions: string;
+    instructionsSha256: string;
+  }>;
 };
 
 export class ContextPackBuilder {

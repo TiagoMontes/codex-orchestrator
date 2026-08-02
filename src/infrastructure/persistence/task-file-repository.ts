@@ -117,6 +117,12 @@ export class TaskFileRepository {
       if (existing.projectId !== task.projectId) {
         throw new OrchestratorError("Task project identity cannot change", { code: "TASK_STATE" });
       }
+      if (task.revision !== existing.revision + 1) {
+        throw new OrchestratorError(
+          `Concurrent task update detected for ${task.id}: expected revision ${existing.revision + 1}, received ${task.revision}`,
+          { code: "TASK_STATE", resumable: true },
+        );
+      }
       await this.store.write(this.taskFile(task.projectId, task.id), taskSchema.parse(task));
       if (state !== undefined) {
         await this.store.write(
@@ -154,6 +160,20 @@ export class TaskFileRepository {
         this.store.read(this.taskFile(entry.projectId, entry.taskId), taskSchema),
       ),
     );
+  }
+
+  async removeProjectEntries(projectId: string): Promise<number> {
+    const lock = await this.locks.acquire("tasks:index");
+    try {
+      const index = await this.readIndex();
+      const removed = index.entries.filter((entry) => entry.projectId === projectId).length;
+      index.entries = index.entries.filter((entry) => entry.projectId !== projectId);
+      index.updatedAt = isoNow(this.clock);
+      await this.store.write(this.paths.tasksIndexFile, index);
+      return removed;
+    } finally {
+      await lock.release();
+    }
   }
 
   private taskFile(projectId: string, taskId: string): string {

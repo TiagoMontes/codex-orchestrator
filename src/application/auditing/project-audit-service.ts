@@ -32,6 +32,7 @@ import { sha256, stableJson } from "../../shared/hashing.js";
 import { ContextSizer } from "../../orchestration/context/context-sizer.js";
 import { ModelRouter } from "../../orchestration/routing/model-router.js";
 import type { ProjectRefresher } from "./project-refresh-service.js";
+import { SkillRegistry } from "../skills/skill-registry.js";
 
 export type ProjectAuditOverrides = {
   profile?: ExecutionProfile;
@@ -60,6 +61,7 @@ export class ProjectAuditService implements ProjectAuditor {
   private readonly git = new GitClient();
   private readonly promptLoader = new PromptLoader();
   private readonly store = new AtomicJsonStore();
+  private readonly skillRegistry = new SkillRegistry();
 
   constructor(
     private readonly configService: ConfigService,
@@ -87,6 +89,7 @@ export class ProjectAuditService implements ProjectAuditor {
     }
     const allTrackedFiles = await this.git.listFilesAtCommit(project.gitRoot, sourceCommit);
     const trackedFiles = allTrackedFiles.slice(0, 5_000);
+    const selectedSkills = await this.skillRegistry.select({ phase: "audit", project });
     const auditContext = {
       projectId: project.id,
       sourceCommit,
@@ -97,6 +100,7 @@ export class ProjectAuditService implements ProjectAuditor {
       })),
       verificationPolicy: project.verificationPolicy,
       trackedFiles,
+      selectedSkills,
       inventoryTruncated: allTrackedFiles.length > trackedFiles.length,
     };
     const estimatedInputTokens = new ContextSizer(

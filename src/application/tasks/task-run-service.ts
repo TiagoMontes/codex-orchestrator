@@ -17,6 +17,7 @@ import type { ModelDecision } from "../../domain/execution/model-decision.js";
 import type { Task } from "../../domain/task/task.js";
 import type { UsageLedgerDocument } from "../../domain/usage/usage-ledger.js";
 import type { VerificationResult } from "../../domain/verification/verification.js";
+import { reviewResultSchema } from "../../domain/review/review.js";
 import type { CodexRuntime } from "../../infrastructure/codex/codex-runtime.js";
 import { DiffService } from "../../infrastructure/git/diff-service.js";
 import { GitClient } from "../../infrastructure/git/git-client.js";
@@ -33,6 +34,7 @@ import type { StatePaths } from "../../infrastructure/persistence/state-paths.js
 import type { TaskFileRepository } from "../../infrastructure/persistence/task-file-repository.js";
 import type { UsageFileRepository } from "../../infrastructure/persistence/usage-file-repository.js";
 import type { VerificationFileRepository } from "../../infrastructure/persistence/verification-file-repository.js";
+import { FileLockManager } from "../../infrastructure/persistence/file-lock.js";
 import { PromptLoader } from "../../prompts/prompt-loader.js";
 import type { Clock } from "../../shared/clock.js";
 import { isoNow, systemClock } from "../../shared/clock.js";
@@ -47,6 +49,8 @@ import { EscalationPolicy } from "../../orchestration/routing/escalation-policy.
 import { ModelRouter, type RoutingOverrides } from "../../orchestration/routing/model-router.js";
 import type { TaskWorktreeService } from "./task-worktree-service.js";
 import { VerificationService } from "./verification-service.js";
+import { SkillRegistry } from "../skills/skill-registry.js";
+import { PersistedTaskCancellation } from "./persisted-task-cancellation.js";
 
 export type TaskRunOverrides = {
   profile?: ExecutionProfile;
@@ -80,7 +84,9 @@ export class TaskRunService implements TaskRunner {
   private readonly integrity = new ContextIntegrityValidator();
   private readonly store = new AtomicJsonStore();
   private readonly textWriter = new AtomicFileWriter();
+  private readonly skillRegistry = new SkillRegistry();
   private readonly repositoryLock: RepositoryLock;
+  private readonly operationLocks: FileLockManager;
   private readonly gitLog: GitCommandLog;
 
   constructor(
@@ -99,12 +105,25 @@ export class TaskRunService implements TaskRunner {
     private readonly clock: Clock = systemClock,
   ) {
     this.repositoryLock = new RepositoryLock(paths);
+    this.operationLocks = new FileLockManager(paths.locksDirectory);
     this.gitLog = new GitCommandLog(paths);
   }
 
   async run(taskId: string, overrides: TaskRunOverrides = {}): Promise<TaskRunReport> {
+    const operationLock = await this.operationLocks.acquire(`task-operation:${taskId}`);
+    try {
+      return await this.runLocked(taskId, overrides);
+    } finally {
+      await operationLock.release();
+    }
+  }
+
+  private async runLocked(taskId: string, overrides: TaskRunOverrides): Promise<TaskRunReport> {
     let task = await this.tasks.get(taskId);
-    if (task.status === "diagnosed" || task.status === "ready-for-implementation") {
+    if (
+      task.status === "diagnosed" ||
+      (task.status === "ready-for-implementation" && task.worktree === undefined)
+    ) {
       task = (await this.worktrees.prepare(taskId)).task;
     }
     if (task.status !== "ready-for-implementation" || task.worktree === undefined) {
@@ -115,6 +134,9 @@ export class TaskRunService implements TaskRunner {
     }
 
     const writerLock = await this.repositoryLock.acquireWriter(task.projectId);
+    const callerSignal = overrides.abortSignal;
+    const cancellation = new PersistedTaskCancellation(this.tasks, taskId, callerSignal);
+    overrides = { ...overrides, abortSignal: cancellation.signal };
     let state = await this.tasks.getState(task.id);
     let primarySnapshot: { head: string; status: string } | undefined;
     let activeReservationId: string | undefined;
@@ -129,7 +151,11 @@ export class TaskRunService implements TaskRunner {
       const git = this.scopedGit(task);
       const manager = new WorktreeManager(this.paths, git);
       const worktree = await manager.inspect(project.gitRoot, task.worktree.path);
-      if (worktree.branch !== task.worktree.branch) {
+      if (
+        worktree.branch !== task.worktree.branch ||
+        task.worktree.baseCommit !== task.baseCommit ||
+        !(await git.isAncestor(project.gitRoot, task.baseCommit, worktree.head))
+      ) {
         throw new OrchestratorError("Task worktree branch identity changed", {
           code: "CONTEXT_INTEGRITY",
         });
@@ -163,16 +189,22 @@ export class TaskRunService implements TaskRunner {
         diffService,
         this.clock,
       );
-      const existingAttempts = (await this.executions.list(project.id, task.id)).filter(
-        (attempt) => attempt.phase === "implementation" || attempt.phase === "correction",
+      const allAttempts = await this.executions.list(project.id, task.id);
+      const existingAttempts = allAttempts.filter(
+        (attempt) =>
+          (attempt.phase === "implementation" || attempt.phase === "correction") &&
+          !attempt.contextPackPath.includes("/review-correction-"),
       );
       const seenFailureSignatures = new Set(
         existingAttempts
           .map((attempt) => attempt.failureSignature)
           .filter((signature): signature is string => signature !== undefined),
       );
+      const priorFailureAttempts = existingAttempts.filter(
+        (attempt) => attempt.failureSignature !== undefined,
+      );
       const maximumAttempts = config.profiles[profile].maxImplementationAttempts;
-      if (existingAttempts.length >= maximumAttempts) {
+      if (priorFailureAttempts.length >= maximumAttempts) {
         await this.stopTask(task, state, "attempt_limit_reached");
       }
       const evidence = await this.evidenceRepository.read(project.id, task.id);
@@ -189,6 +221,53 @@ export class TaskRunService implements TaskRunner {
         });
       }
       let latestFailure: string | null = null;
+      const interruptedReviewCorrection = allAttempts.some(
+        (attempt) =>
+          attempt.phase === "correction" &&
+          attempt.contextPackPath.includes("/review-correction-") &&
+          attempt.status !== "succeeded",
+      );
+      if (priorFailureAttempts.length > 0) {
+        const priorVerification = await this.verificationRepository.read(project.id, task.id);
+        if (
+          priorVerification.taskId !== task.id ||
+          priorVerification.sourceCommit !== diagnosis.sourceCommit ||
+          priorVerification.overallStatus === "passed"
+        ) {
+          throw new OrchestratorError(
+            "Resume is missing exact prior verification failure evidence",
+            {
+              code: "CONTEXT_INTEGRITY",
+            },
+          );
+        }
+        latestFailure = priorVerification.commands
+          .filter((command) => command.status !== "passed")
+          .map((command) => `${command.name}: ${command.excerpt}`)
+          .join("\n")
+          .slice(-config.context.maxExcerptCharacters);
+      } else if (interruptedReviewCorrection) {
+        const priorReview = await this.store.read(
+          join(this.paths.taskDirectory(project.id, task.id), "review.json"),
+          reviewResultSchema,
+        );
+        if (
+          priorReview.taskId !== task.id ||
+          priorReview.sourceCommit !== diagnosis.sourceCommit ||
+          priorReview.verdict !== "changes-requested"
+        ) {
+          throw new OrchestratorError("Interrupted review correction has no compatible findings", {
+            code: "CONTEXT_INTEGRITY",
+          });
+        }
+        latestFailure = stableJson({
+          reviewVerdict: priorReview.verdict,
+          findings: priorReview.findings,
+          acceptanceCriteriaAssessment: priorReview.acceptanceCriteriaAssessment.filter(
+            (item) => item.status !== "met",
+          ),
+        }).slice(-config.context.maxExcerptCharacters);
+      }
       let priorDecision: ModelDecision | undefined;
       let lastDiff: DiffArtifact | undefined;
       let lastVerification: VerificationResult | undefined;
@@ -201,9 +280,9 @@ export class TaskRunService implements TaskRunner {
         "Implementation started",
       ));
       for (
-        let attemptNumber = existingAttempts.length + 1;
-        attemptNumber <= maximumAttempts;
-        attemptNumber += 1
+        let attemptOrdinal = priorFailureAttempts.length + 1;
+        attemptOrdinal <= maximumAttempts;
+        attemptOrdinal += 1
       ) {
         if (overrides.abortSignal?.aborted ?? false) {
           throw new OrchestratorError("Task run was cancelled", {
@@ -213,12 +292,16 @@ export class TaskRunService implements TaskRunner {
         }
         await this.assertPrimaryUnchanged(git, project.gitRoot, primarySnapshot);
         const executionId = randomUUID();
-        const phase = attemptNumber === 1 ? "implementation" : "correction";
+        const attemptNumber =
+          existingAttempts.length + (attemptOrdinal - priorFailureAttempts.length);
+        const phase =
+          attemptOrdinal === 1 && !interruptedReviewCorrection ? "implementation" : "correction";
         const worktreeHead = await git.resolveCommit(worktree.path, "HEAD");
+        const selectedSkills = await this.skillRegistry.select({ phase, task, project });
         const contextPack = new ContextPackBuilder(config).build({
           phase,
           objective:
-            attemptNumber === 1
+            phase === "implementation"
               ? `Implement ${task.title} in the isolated worktree`
               : `Correct ${task.title} using only the latest deterministic failure`,
           task,
@@ -234,6 +317,7 @@ export class TaskRunService implements TaskRunner {
           confirmedFacts: diagnosis.confirmedFacts.map((fact) => fact.statement),
           confirmedCauses: diagnosis.rootCauses.map((cause) => cause.statement),
           latestFailure,
+          selectedSkills,
           outputSchema: toJsonSchema(implementationResultSchema),
         });
         await this.integrity.assertLiveInstructionFiles(contextPack, {
@@ -289,7 +373,7 @@ export class TaskRunService implements TaskRunner {
           profile,
           estimatedCallTokens,
           remainingBudgetTokens: remainingBudget,
-          priorFailedAttempts: attemptNumber - 1,
+          priorFailedAttempts: attemptOrdinal - 1,
           overrides: routingOverrides,
         });
         priorDecision = modelDecision;
@@ -337,7 +421,7 @@ export class TaskRunService implements TaskRunner {
         await this.executions.save(project.id, execution);
         try {
           const prompt = await this.promptLoader.render(
-            attemptNumber === 1 ? "implementation.prompt.md" : "correction.prompt.md",
+            phase === "implementation" ? "implementation.prompt.md" : "correction.prompt.md",
             {
               TASK_ID: task.id,
               SOURCE_COMMIT: diagnosis.sourceCommit,
@@ -347,7 +431,7 @@ export class TaskRunService implements TaskRunner {
             },
           );
           const runtimeResult = await this.runtime.runStructured({
-            role: attemptNumber === 1 ? "implementer" : "corrector",
+            role: phase === "implementation" ? "implementer" : "corrector",
             prompt,
             workingDirectory: worktree.path,
             model: modelDecision.model,
@@ -482,7 +566,7 @@ export class TaskRunService implements TaskRunner {
             sourceCommitChanged: false,
             repeatedFailureSignature: repeated,
             hasNewEvidence: !repeated,
-            attempts: attemptNumber,
+            attempts: attemptOrdinal,
             maximumAttempts,
           });
           if (decision.stop) {
@@ -508,7 +592,14 @@ export class TaskRunService implements TaskRunner {
               .catch(() => undefined);
             activeReservationId = undefined;
           }
-          const normalized = toOrchestratorError(error);
+          let normalized = toOrchestratorError(error);
+          if (overrides.abortSignal?.aborted ?? false) {
+            normalized = new OrchestratorError("Task run was cancelled", {
+              code: "CANCELLED",
+              resumable: true,
+              cause: error,
+            });
+          }
           if (execution.status === "running") {
             execution = {
               ...execution,
@@ -540,7 +631,7 @@ export class TaskRunService implements TaskRunner {
         resumable: true,
       });
     } catch (error) {
-      const normalized = toOrchestratorError(error);
+      let normalized = toOrchestratorError(error);
       if (activeReservationId !== undefined) {
         await this.usage
           .releaseReservation(task.projectId, task.id, activeReservationId)
@@ -548,12 +639,20 @@ export class TaskRunService implements TaskRunner {
       }
       state = await this.tasks.getState(task.id);
       task = await this.tasks.get(task.id);
+      if (state.status === "cancelled" && normalized.code !== "CANCELLED") {
+        normalized = new OrchestratorError("Task run was cancelled", {
+          code: "CANCELLED",
+          resumable: true,
+          cause: error,
+        });
+      }
       if (["implementing", "verifying", "ready-for-implementation"].includes(state.status)) {
         const nextState = normalized.code === "CANCELLED" ? "cancelled" : "blocked";
         ({ task, state } = await this.transition(task, state, nextState, normalized.message));
       }
       throw normalized;
     } finally {
+      cancellation.dispose(callerSignal);
       await writerLock.release();
     }
   }

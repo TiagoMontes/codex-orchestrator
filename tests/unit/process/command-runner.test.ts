@@ -74,4 +74,28 @@ describe("CommandRunner", () => {
     expect(timedOut.timedOut).toBe(true);
     expect(timedOut.exitCode === 0 && timedOut.signal === undefined).toBe(false);
   });
+
+  it("does not spawn a command when its signal is already aborted", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "cxo-command-abort-"));
+    temporaryDirectories.push(directory);
+    const marker = join(directory, "must-not-exist");
+    const controller = new AbortController();
+    controller.abort(new Error("cancelled"));
+
+    const result = await new CommandRunner(DEFAULT_CONFIG).run({
+      argv: [
+        process.execPath,
+        "-e",
+        `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "bad")`,
+      ],
+      cwd: directory,
+      timeoutMs: 5_000,
+      logPath: join(directory, "aborted.log"),
+      abortSignal: controller.signal,
+    });
+
+    expect(result).toMatchObject({ aborted: true, exitCode: null, timedOut: false });
+    await expect(access(marker)).rejects.toBeDefined();
+    expect(await readFile(result.logPath, "utf8")).toContain("command skipped");
+  });
 });

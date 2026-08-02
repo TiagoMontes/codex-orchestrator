@@ -27,7 +27,31 @@ export const contextPackSchema = z
     diffPatch: z.string().optional(),
     verification: z.unknown().optional(),
     instructionHashes: z.array(z.object({ path: z.string(), sha256: z.string() }).strict()),
-    selectedSkills: z.array(z.object({ name: z.string(), sha256: z.string() }).strict()),
+    selectedSkills: z
+      .array(
+        z
+          .object({
+            name: z.string().min(1),
+            sha256: z.string().regex(/^[a-f0-9]{64}$/u),
+            source: z.enum(["bundled", "project", "user"]),
+            path: z.string().min(1),
+            instructions: z.string().min(1).max(8_000),
+            instructionsSha256: z.string().regex(/^[a-f0-9]{64}$/u),
+          })
+          .strict(),
+      )
+      .superRefine((skills, context) => {
+        const names = new Set<string>();
+        for (const skill of skills) {
+          if (names.has(skill.name)) {
+            context.addIssue({
+              code: "custom",
+              message: `Duplicate selected skill: ${skill.name}`,
+            });
+          }
+          names.add(skill.name);
+        }
+      }),
     acceptanceCriteria: z.array(acceptanceCriterionSchema),
     constraints: z.array(z.string()),
     protectedContracts: z.array(z.string()),

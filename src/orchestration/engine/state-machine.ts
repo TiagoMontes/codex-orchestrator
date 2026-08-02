@@ -21,20 +21,9 @@ const ALLOWED_TRANSITIONS: Readonly<Record<TaskStatus, readonly TaskStatus[]>> =
   reviewing: ["completed", "correcting", "blocked", "failed", "cancelled"],
   correcting: ["verifying", "blocked", "failed", "cancelled"],
   completed: [],
-  blocked: [
-    "ready-for-diagnosis",
-    "diagnosing",
-    "worktree-preparing",
-    "ready-for-implementation",
-    "implementing",
-    "verifying",
-    "reviewing",
-    "correcting",
-    "cancelled",
-    "failed",
-  ],
+  blocked: ["ready-for-diagnosis", "ready-for-implementation", "reviewing", "cancelled", "failed"],
   failed: [],
-  cancelled: [],
+  cancelled: ["ready-for-diagnosis", "ready-for-implementation", "reviewing"],
 };
 
 export type TransitionInput = Omit<TaskTransition, "previousState" | "timestamp"> & {
@@ -67,7 +56,14 @@ export class TaskStateMachine {
       schemaVersion: state.schemaVersion,
       taskId: state.taskId,
       status: input.nextState,
-      ...(input.nextState === "blocked" ? { resumableFrom: state.status } : {}),
+      ...(input.nextState === "blocked" || input.nextState === "cancelled"
+        ? {
+            resumableFrom:
+              state.status === "blocked" || state.status === "cancelled"
+                ? (state.resumableFrom ?? state.status)
+                : state.status,
+          }
+        : {}),
       transitions: [...state.transitions, transition],
       updatedAt: input.timestamp,
     };

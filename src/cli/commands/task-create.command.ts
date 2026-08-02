@@ -6,6 +6,7 @@ import type { TaskManager } from "../../application/tasks/task-service.js";
 import { OrchestratorError } from "../../shared/errors.js";
 import type { OutputWriter } from "../output.js";
 import { writeResult } from "../output.js";
+import { parseCliValue } from "../validation.js";
 
 export function registerTaskCreateCommand(
   task: Command,
@@ -29,7 +30,11 @@ export function registerTaskCreateCommand(
           });
         }
         const config = await configService.load();
-        const profile = executionProfileSchema.parse(options.profile ?? config.defaultProfile);
+        const profile = parseCliValue(
+          executionProfileSchema,
+          options.profile ?? config.defaultProfile,
+          "--profile",
+        );
         const feedback =
           options.from === undefined
             ? await readStandardInput()

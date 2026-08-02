@@ -69,6 +69,7 @@ export class VerificationService {
     await this.diffService.assertCurrent(input.diff, input.worktreePath);
     const commandResults: VerificationCommandResult[] = [];
     const evidence: Evidence[] = [];
+    let cancelled = false;
     for (const [index, command] of approved.entries()) {
       const logPath = join(
         this.paths.taskDirectory(input.project.id, input.task.id),
@@ -82,6 +83,7 @@ export class VerificationService {
         logPath,
         ...(input.abortSignal === undefined ? {} : { abortSignal: input.abortSignal }),
       });
+      cancelled ||= raw.aborted;
       let status: VerificationCommandResult["status"] =
         raw.spawnError !== undefined || raw.aborted
           ? "blocked"
@@ -144,6 +146,12 @@ export class VerificationService {
     });
     await this.verificationRepository.save(input.project.id, result, input.executionId);
     await this.evidenceRepository.merge(input.project.id, input.task.id, evidence);
+    if (cancelled) {
+      throw new OrchestratorError("Deterministic verification was cancelled", {
+        code: "CANCELLED",
+        resumable: true,
+      });
+    }
     if (overallStatus === "passed" || overallStatus === "blocked") {
       return { result, evidence };
     }

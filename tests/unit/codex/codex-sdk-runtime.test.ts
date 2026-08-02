@@ -130,6 +130,65 @@ describe("CodexSdkRuntime", () => {
     expect(result.compatibility).toMatchObject({ fallbackApplied: true, mappedReasoning: "high" });
   });
 
+  it("performs one isolated low-cost repair for invalid structured output", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "cxo-sdk-"));
+    temporaryDirectories.push(directory);
+    const prompts: string[] = [];
+    const options: ThreadOptions[] = [];
+    let starts = 0;
+    const runtime = new CodexSdkRuntime({
+      clientFactory: () => ({
+        startThread: (threadOptions) => {
+          if (threadOptions !== undefined) options.push(threadOptions);
+          starts += 1;
+          const response = starts === 1 ? '{"answer":1}' : '{"answer":"repaired"}';
+          const thread = fakeThread(`repair-${starts}`, [
+            { type: "thread.started", thread_id: `repair-${starts}` },
+            {
+              type: "item.completed",
+              item: { id: `message-${starts}`, type: "agent_message", text: response },
+            },
+            {
+              type: "turn.completed",
+              usage: {
+                input_tokens: 5,
+                cached_input_tokens: 0,
+                cache_write_input_tokens: 0,
+                output_tokens: 2,
+                reasoning_output_tokens: 0,
+              },
+            },
+          ]);
+          return {
+            ...thread,
+            runStreamed: async (input, turnOptions) => {
+              prompts.push(input);
+              return thread.runStreamed(input, turnOptions);
+            },
+          };
+        },
+        resumeThread: () => {
+          throw new Error("repair must use a fresh thread");
+        },
+      }),
+    });
+
+    const result = await runtime.runStructured(makeRequest(directory, "high"));
+
+    expect(result).toMatchObject({
+      threadId: "repair-2",
+      output: { answer: "repaired" },
+      runtimeAttempts: 2,
+      usage: { inputTokens: 10, outputTokens: 4, totalTokens: 14 },
+    });
+    expect(options.map((item) => item.modelReasoningEffort)).toEqual(["high", "minimal"]);
+    expect(prompts[1]).toContain('{"answer":1}');
+    expect(prompts[1]).not.toContain("Return structured output");
+    expect(await readFile(makeRequest(directory, "high").eventsPath, "utf8")).toContain(
+      "runtime.output_repair",
+    );
+  });
+
   it("honors explicit cancellation before starting an SDK thread", async () => {
     const directory = await mkdtemp(join(tmpdir(), "cxo-sdk-"));
     temporaryDirectories.push(directory);

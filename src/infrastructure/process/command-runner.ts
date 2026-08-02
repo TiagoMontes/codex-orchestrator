@@ -64,6 +64,23 @@ export class CommandRunner {
       this.config.context.maxExcerptCharacters,
       this.redactor,
     ).open();
+    if (request.abortSignal?.aborted ?? false) {
+      log.push(
+        "stderr",
+        Buffer.from("[orchestrator] command skipped because execution was cancelled\n"),
+      );
+      const { excerpt, logSha256 } = await log.close();
+      return {
+        startedAt,
+        completedAt: isoNow(this.clock),
+        exitCode: null,
+        timedOut: false,
+        aborted: true,
+        logPath: request.logPath,
+        logSha256,
+        excerpt,
+      };
+    }
     const environment = this.sanitizer.sanitize(request.environment ?? process.env).environment;
     const command = request.argv[0] as string;
     const args = request.argv.slice(1);

@@ -4,6 +4,7 @@ import { isoNow, systemClock } from "../../shared/clock.js";
 import { sha256 } from "../../shared/hashing.js";
 import { OrchestratorError } from "../../shared/errors.js";
 import { projectSchema, type Project } from "../../domain/project/project.js";
+import type { Task } from "../../domain/task/task.js";
 import { GitClient } from "../../infrastructure/git/git-client.js";
 import type { ProjectFileRepository } from "../../infrastructure/persistence/project-file-repository.js";
 import { StackDetector } from "./stack-detector.js";
@@ -23,6 +24,10 @@ export class ProjectService implements ProjectManager {
     private readonly stackDetector = new StackDetector(),
     private readonly metadataScanner = new ProjectMetadataScanner(),
     private readonly clock: Clock = systemClock,
+    private readonly tasks?: {
+      list(projectId?: string): Promise<Task[]>;
+      removeProjectEntries(projectId: string): Promise<number>;
+    },
   ) {}
 
   async add(input: { path: string; name?: string; baseRef?: string }): Promise<Project> {
@@ -79,8 +84,35 @@ export class ProjectService implements ProjectManager {
     return this.repository.get(reference);
   }
 
-  remove(reference: string): Promise<Project> {
-    return this.repository.remove(reference);
+  async remove(reference: string): Promise<Project> {
+    const project = await this.repository.get(reference);
+    const tasks = await this.tasks?.list(project.id);
+    const taskWithWorktree = tasks?.find((task) => task.worktree !== undefined);
+    if (taskWithWorktree !== undefined) {
+      throw new OrchestratorError(
+        `Project ${project.id} still owns task worktree ${taskWithWorktree.id}`,
+        { code: "PROJECT", nextCommand: `cxo task cleanup ${taskWithWorktree.id}` },
+      );
+    }
+    const active = tasks?.find((task) =>
+      [
+        "normalizing",
+        "diagnosing",
+        "worktree-preparing",
+        "implementing",
+        "verifying",
+        "reviewing",
+        "correcting",
+      ].includes(task.status),
+    );
+    if (active !== undefined) {
+      throw new OrchestratorError(`Project ${project.id} still has active task ${active.id}`, {
+        code: "PROJECT",
+        nextCommand: `cxo task cancel ${active.id}`,
+      });
+    }
+    await this.tasks?.removeProjectEntries(project.id);
+    return this.repository.remove(project.id);
   }
 
   private async uniqueId(name: string, gitRoot: string): Promise<string> {

@@ -26,6 +26,7 @@ import type { ExecutionFileRepository } from "../../infrastructure/persistence/e
 import type { StatePaths } from "../../infrastructure/persistence/state-paths.js";
 import type { TaskFileRepository } from "../../infrastructure/persistence/task-file-repository.js";
 import type { UsageFileRepository } from "../../infrastructure/persistence/usage-file-repository.js";
+import { FileLockManager } from "../../infrastructure/persistence/file-lock.js";
 import { resolveSafePath } from "../../infrastructure/filesystem/path-safety.js";
 import { PromptLoader } from "../../prompts/prompt-loader.js";
 import type { Clock } from "../../shared/clock.js";
@@ -38,6 +39,8 @@ import { ContextPackBuilder } from "../../orchestration/context/context-pack-bui
 import { TaskStateMachine } from "../../orchestration/engine/state-machine.js";
 import { ModelRouter, type RoutingOverrides } from "../../orchestration/routing/model-router.js";
 import type { ExecutionAttempt } from "../../domain/execution/execution-attempt.js";
+import { SkillRegistry } from "../skills/skill-registry.js";
+import { PersistedTaskCancellation } from "./persisted-task-cancellation.js";
 
 export type DiagnosisOverrides = {
   profile?: ExecutionProfile;
@@ -49,6 +52,7 @@ export type DiagnosisOverrides = {
   allowNetwork?: boolean;
   baseRef?: string;
   timeoutMs?: number;
+  abortSignal?: AbortSignal;
 };
 
 export type DiagnosisRunReport = {
@@ -70,6 +74,8 @@ export class TaskDiagnosisService implements TaskDiagnosisManager {
   private readonly contextStore = new AtomicJsonStore();
   private readonly promptLoader = new PromptLoader();
   private readonly integrity = new ContextIntegrityValidator();
+  private readonly skillRegistry = new SkillRegistry();
+  private readonly operationLocks: FileLockManager;
 
   constructor(
     private readonly configService: ConfigService,
@@ -83,9 +89,49 @@ export class TaskDiagnosisService implements TaskDiagnosisManager {
     private readonly executions: ExecutionFileRepository,
     private readonly decisions: DecisionFileRepository,
     private readonly clock: Clock = systemClock,
-  ) {}
+  ) {
+    this.operationLocks = new FileLockManager(paths.locksDirectory);
+  }
 
   async diagnose(taskId: string, overrides: DiagnosisOverrides = {}): Promise<DiagnosisRunReport> {
+    const operationLock = await this.operationLocks.acquire(`task-operation:${taskId}`);
+    try {
+      try {
+        return await this.diagnoseLocked(taskId, overrides);
+      } catch (error) {
+        let normalized = toOrchestratorError(error);
+        const persistedTask = await this.tasks.get(taskId).catch(() => undefined);
+        if (persistedTask !== undefined) {
+          const ledger = await this.usage.read(persistedTask.projectId, taskId);
+          for (const reservation of ledger.reservations.filter(
+            (item) => item.phase === "diagnosis",
+          )) {
+            await this.usage
+              .releaseReservation(persistedTask.projectId, taskId, reservation.id)
+              .catch(() => undefined);
+          }
+          const persistedState = await this.tasks.getState(taskId);
+          if (persistedState.status === "cancelled") {
+            normalized = new OrchestratorError("Task diagnosis was cancelled", {
+              code: "CANCELLED",
+              resumable: true,
+              cause: error,
+            });
+          } else if (persistedState.status === "diagnosing") {
+            await this.blockTask(persistedTask, persistedState, normalized.message);
+          }
+        }
+        throw normalized;
+      }
+    } finally {
+      await operationLock.release();
+    }
+  }
+
+  private async diagnoseLocked(
+    taskId: string,
+    overrides: DiagnosisOverrides,
+  ): Promise<DiagnosisRunReport> {
     let task = await this.tasks.get(taskId);
     let state = await this.tasks.getState(taskId);
     if (state.status !== "ready-for-diagnosis") {
@@ -97,6 +143,15 @@ export class TaskDiagnosisService implements TaskDiagnosisManager {
     const project = await this.projects.inspect(task.projectId);
     const config = applyBudgetOverrides(await this.configService.load(), overrides, task.profile);
     const profile = overrides.profile ?? task.profile;
+    const priorDiagnosisAttempts = (await this.executions.list(project.id, task.id)).filter(
+      (attempt) => attempt.phase === "diagnosis",
+    ).length;
+    if (priorDiagnosisAttempts >= config.profiles[profile].maxDiagnosisAttempts) {
+      throw new OrchestratorError("Diagnosis attempt limit reached", {
+        code: "BUDGET",
+        resumable: true,
+      });
+    }
     const baseRef = overrides.baseRef ?? task.baseRef ?? project.baseRef;
     const sourceCommit = await this.git.resolveCommit(project.gitRoot, baseRef);
     const currentHead = await this.git.resolveCommit(project.gitRoot, "HEAD");
@@ -135,6 +190,11 @@ export class TaskDiagnosisService implements TaskDiagnosisManager {
 
     const executionId = randomUUID();
     const evidence: Evidence[] = [];
+    const selectedSkills = await this.skillRegistry.select({
+      phase: "diagnosis",
+      task,
+      project,
+    });
     const pack = new ContextPackBuilder(config).build({
       phase: "diagnosis",
       objective: `Diagnose ${task.title} without modifying the repository`,
@@ -143,6 +203,7 @@ export class TaskDiagnosisService implements TaskDiagnosisManager {
       sourceCommit,
       evidence,
       relevantFiles: task.requestedScope.estimatedFiles,
+      selectedSkills,
       outputSchema: toJsonSchema(diagnosisAgentResultSchema),
     });
     await this.integrity.assertLiveInstructionFiles(pack, { task, project, sourceCommit });
@@ -191,7 +252,7 @@ export class TaskDiagnosisService implements TaskDiagnosisManager {
       id: executionId,
       taskId: task.id,
       phase: "diagnosis",
-      attemptNumber: 1,
+      attemptNumber: priorDiagnosisAttempts + 1,
       modelDecision,
       sandboxMode: "read-only",
       contextPackPath,
@@ -201,6 +262,7 @@ export class TaskDiagnosisService implements TaskDiagnosisManager {
       eventsPath,
     };
     await this.executions.save(project.id, attempt);
+    const cancellation = new PersistedTaskCancellation(this.tasks, taskId, overrides.abortSignal);
 
     try {
       const prompt = await this.promptLoader.render("diagnosis.prompt.md", {
@@ -221,7 +283,17 @@ export class TaskDiagnosisService implements TaskDiagnosisManager {
         outputValidator: diagnosisAgentResultSchema,
         timeoutMs: overrides.timeoutMs ?? config.runtime.defaultTimeoutSeconds * 1_000,
         eventsPath,
+        abortSignal: cancellation.signal,
       });
+      if (
+        cancellation.signal.aborted ||
+        (await this.tasks.getState(taskId)).status === "cancelled"
+      ) {
+        throw new OrchestratorError("Task diagnosis was cancelled", {
+          code: "CANCELLED",
+          resumable: true,
+        });
+      }
       const afterStatus = await this.git.statusPorcelain(project.gitRoot);
       const afterHead = await this.git.resolveCommit(project.gitRoot, "HEAD");
       if (afterStatus !== beforeStatus || afterHead !== sourceCommit) {
@@ -291,7 +363,16 @@ export class TaskDiagnosisService implements TaskDiagnosisManager {
       await this.usage
         .releaseReservation(project.id, task.id, admission.reservation.id)
         .catch(() => undefined);
-      const normalized = toOrchestratorError(error);
+      let normalized = toOrchestratorError(error);
+      const persistedState = await this.tasks.getState(taskId);
+      const persistedTask = await this.tasks.get(taskId);
+      if (persistedState.status === "cancelled") {
+        normalized = new OrchestratorError("Task diagnosis was cancelled", {
+          code: "CANCELLED",
+          resumable: true,
+          cause: error,
+        });
+      }
       const failedAt = isoNow(this.clock);
       attempt = {
         ...attempt,
@@ -305,17 +386,26 @@ export class TaskDiagnosisService implements TaskDiagnosisManager {
         },
       };
       await this.executions.save(project.id, attempt);
-      const nextState = normalized.code === "CANCELLED" ? "cancelled" : "blocked";
-      state = this.stateMachine.transition(state, {
-        nextState,
-        timestamp: failedAt,
-        reason: normalized.message,
-        actor: "system",
-        executionId,
-      });
-      task = { ...task, status: nextState, revision: task.revision + 1, updatedAt: failedAt };
-      await this.tasks.update(task, state);
+      if (persistedState.status !== "cancelled") {
+        const nextState = normalized.code === "CANCELLED" ? "cancelled" : "blocked";
+        state = this.stateMachine.transition(persistedState, {
+          nextState,
+          timestamp: failedAt,
+          reason: normalized.message,
+          actor: "system",
+          executionId,
+        });
+        task = {
+          ...persistedTask,
+          status: nextState,
+          revision: persistedTask.revision + 1,
+          updatedAt: failedAt,
+        };
+        await this.tasks.update(task, state);
+      }
       throw normalized;
+    } finally {
+      cancellation.dispose(overrides.abortSignal);
     }
   }
 

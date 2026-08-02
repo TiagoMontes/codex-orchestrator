@@ -109,6 +109,53 @@ export class CodexSdkRuntime implements CodexRuntime {
             throw controller.signal.reason;
           }
           const result = await this.runAttempt(request, effort, controller.signal, recorder);
+          let output: T;
+          try {
+            output = parseStructuredOutput(result.finalResponse, request.outputValidator);
+          } catch (validationError) {
+            if (attempt > 0) throw validationError;
+            await recorder.record({
+              type: "runtime.output_repair",
+              originalThreadId: result.threadId,
+            });
+            const repairRequest = { ...request };
+            delete repairRequest.resumeThreadId;
+            repairRequest.prompt = repairPrompt(result.finalResponse, validationError);
+            repairRequest.reasoningPreset = "minimal";
+            const repair = await this.runAttempt(
+              repairRequest,
+              "minimal",
+              controller.signal,
+              recorder,
+            );
+            try {
+              output = parseStructuredOutput(repair.finalResponse, request.outputValidator);
+            } catch (repairError) {
+              throw new CodexRuntimeError("Codex structured-output repair failed", {
+                cause: repairError,
+                resumable: true,
+              });
+            }
+            const compatibility: CodexCompatibilityMetadata = {
+              sdkVersion: "0.146.0",
+              requestedReasoning: request.reasoningPreset,
+              mappedReasoning: effort,
+              fallbackApplied: false,
+              missingUsageFields: [
+                ...new Set([...result.missingUsageFields, ...repair.missingUsageFields]),
+              ],
+            };
+            await recorder.record({ type: "runtime.compatibility", compatibility });
+            return {
+              threadId: repair.threadId,
+              output,
+              eventsPath: request.eventsPath,
+              usage: addUsage(result.usage, repair.usage),
+              finalResponse: repair.finalResponse,
+              runtimeAttempts: 2,
+              compatibility,
+            };
+          }
           const compatibility: CodexCompatibilityMetadata = {
             sdkVersion: "0.146.0",
             requestedReasoning: request.reasoningPreset,
@@ -120,7 +167,7 @@ export class CodexSdkRuntime implements CodexRuntime {
           await recorder.record({ type: "runtime.compatibility", compatibility });
           return {
             threadId: result.threadId,
-            output: parseStructuredOutput(result.finalResponse, request.outputValidator),
+            output,
             eventsPath: request.eventsPath,
             usage: result.usage,
             finalResponse: result.finalResponse,
@@ -133,6 +180,12 @@ export class CodexSdkRuntime implements CodexRuntime {
               type: request.abortSignal?.aborted ? "runtime.cancelled" : "runtime.timeout",
             });
             if (request.abortSignal?.aborted ?? false) {
+              if (
+                request.abortSignal?.reason instanceof OrchestratorError &&
+                request.abortSignal.reason.code !== "CANCELLED"
+              ) {
+                throw request.abortSignal.reason;
+              }
               throw new OrchestratorError("Codex call was cancelled", {
                 code: "CANCELLED",
                 resumable: true,
@@ -184,7 +237,9 @@ export class CodexSdkRuntime implements CodexRuntime {
       modelReasoningEffort: effort,
       sandboxMode: request.sandboxMode,
       workingDirectory: request.workingDirectory,
-      skipGitRepoCheck: false,
+      // Normalization runs only in state-owned storage and never inspects a target repository.
+      // Every target-backed role keeps the SDK Git safety check enabled.
+      skipGitRepoCheck: request.role === "normalizer",
       networkAccessEnabled: request.networkAccessEnabled,
       webSearchMode: "disabled",
       approvalPolicy: "never",
@@ -242,6 +297,34 @@ export class CodexSdkRuntime implements CodexRuntime {
     }
     return valid;
   }
+}
+
+function repairPrompt(invalidOutput: string, validationError: unknown): string {
+  const errorMessage =
+    validationError instanceof Error ? validationError.message : "Structured validation failed";
+  return [
+    "Repair the invalid structured output below.",
+    "Return only one JSON value matching the supplied output schema.",
+    "Do not add commentary and do not infer facts beyond the invalid output.",
+    "",
+    "Validation error:",
+    errorMessage.slice(0, 2_000),
+    "",
+    "Invalid output:",
+    invalidOutput.slice(0, 8_000),
+  ].join("\n");
+}
+
+function addUsage(left: NormalizedUsage, right: NormalizedUsage): NormalizedUsage {
+  return {
+    inputTokens: left.inputTokens + right.inputTokens,
+    cachedInputTokens: left.cachedInputTokens + right.cachedInputTokens,
+    cacheWriteInputTokens: left.cacheWriteInputTokens + right.cacheWriteInputTokens,
+    outputTokens: left.outputTokens + right.outputTokens,
+    reasoningOutputTokens: left.reasoningOutputTokens + right.reasoningOutputTokens,
+    totalTokens: left.totalTokens + right.totalTokens,
+    source: left.source === "actual" && right.source === "actual" ? "actual" : "estimated",
+  };
 }
 
 export function normalizeUsage(usage: Partial<Usage> | undefined): {

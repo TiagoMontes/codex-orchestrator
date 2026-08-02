@@ -7,8 +7,11 @@ async function main(): Promise<void> {
   try {
     await program.parseAsync(process.argv);
   } catch (error) {
-    const debug = program.opts<{ debug?: boolean }>().debug ?? false;
-    process.exitCode = handleCliError(error, consoleOutput, debug);
+    const options = program.opts<{ debug?: boolean; json?: boolean }>();
+    process.exitCode = handleCliError(error, consoleOutput, {
+      debug: options.debug === true || process.argv.includes("--debug"),
+      json: options.json === true || process.argv.includes("--json"),
+    });
   }
 }
 

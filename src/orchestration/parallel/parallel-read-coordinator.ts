@@ -32,6 +32,7 @@ import { ContextBudgetManager } from "../context/context-budget-manager.js";
 import { ContextIntegrityValidator } from "../context/context-integrity-validator.js";
 import { ContextPackBuilder } from "../context/context-pack-builder.js";
 import { ModelRouter, type RoutingOverrides } from "../routing/model-router.js";
+import { SkillRegistry } from "../../application/skills/skill-registry.js";
 import {
   consolidatedReadResultSchema,
   readWorkerResultSchema,
@@ -67,6 +68,7 @@ export class ParallelReadCoordinator {
   private readonly store = new AtomicJsonStore();
   private readonly promptLoader = new PromptLoader();
   private readonly integrity = new ContextIntegrityValidator();
+  private readonly skillRegistry = new SkillRegistry();
   private readonly gitLog: GitCommandLog;
   private usageMutation: Promise<void> = Promise.resolve();
 
@@ -222,6 +224,11 @@ export class ParallelReadCoordinator {
     readerCount: number;
   }): Promise<PreparedWorker> {
     const executionId = randomUUID();
+    const selectedSkills = await this.skillRegistry.select({
+      phase: "exploration",
+      task: input.task,
+      project: input.project,
+    });
     const pack = new ContextPackBuilder(this.config).build({
       phase: "exploration",
       objective: input.workstream.objective,
@@ -230,6 +237,7 @@ export class ParallelReadCoordinator {
       sourceCommit: input.sourceCommit,
       evidence: [],
       relevantFiles: input.workstream.relevantFiles,
+      selectedSkills,
       outputSchema: toJsonSchema(readWorkerResultSchema),
     });
     await this.integrity.assertLiveInstructionFiles(pack, {

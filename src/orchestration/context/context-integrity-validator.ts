@@ -43,6 +43,11 @@ export class ContextIntegrityValidator {
     ) {
       mismatches.push("instruction files");
     }
+    if (
+      pack.selectedSkills.some((skill) => sha256(skill.instructions) !== skill.instructionsSha256)
+    ) {
+      mismatches.push("selected skill instructions");
+    }
     if (mismatches.length > 0) {
       throw new OrchestratorError(`Context integrity violation: ${mismatches.join(", ")}`, {
         code: "CONTEXT_INTEGRITY",
@@ -65,6 +70,14 @@ export class ContextIntegrityValidator {
           .catch(() => undefined);
         if (actual === undefined || actual !== expected.get(item.relativePath))
           stale.push(item.relativePath);
+      }),
+    );
+    await Promise.all(
+      pack.selectedSkills.map(async (skill) => {
+        const actual = await readFile(skill.path)
+          .then(sha256)
+          .catch(() => undefined);
+        if (actual === undefined || actual !== skill.sha256) stale.push(`skill:${skill.name}`);
       }),
     );
     if (stale.length > 0) {

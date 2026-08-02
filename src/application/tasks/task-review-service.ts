@@ -40,6 +40,7 @@ import type { StatePaths } from "../../infrastructure/persistence/state-paths.js
 import type { TaskFileRepository } from "../../infrastructure/persistence/task-file-repository.js";
 import type { UsageFileRepository } from "../../infrastructure/persistence/usage-file-repository.js";
 import type { VerificationFileRepository } from "../../infrastructure/persistence/verification-file-repository.js";
+import { FileLockManager } from "../../infrastructure/persistence/file-lock.js";
 import { PromptLoader } from "../../prompts/prompt-loader.js";
 import type { Clock } from "../../shared/clock.js";
 import { isoNow, systemClock } from "../../shared/clock.js";
@@ -51,6 +52,8 @@ import { ContextPackBuilder } from "../../orchestration/context/context-pack-bui
 import { TaskStateMachine } from "../../orchestration/engine/state-machine.js";
 import { ModelRouter, type RoutingOverrides } from "../../orchestration/routing/model-router.js";
 import { VerificationService } from "./verification-service.js";
+import { SkillRegistry } from "../skills/skill-registry.js";
+import { PersistedTaskCancellation } from "./persisted-task-cancellation.js";
 
 export type TaskReviewOverrides = {
   profile?: ExecutionProfile;
@@ -95,7 +98,9 @@ export class TaskReviewService implements TaskReviewer {
   private readonly promptLoader = new PromptLoader();
   private readonly integrity = new ContextIntegrityValidator();
   private readonly store = new AtomicJsonStore();
+  private readonly skillRegistry = new SkillRegistry();
   private readonly repositoryLock: RepositoryLock;
+  private readonly operationLocks: FileLockManager;
   private readonly gitLog: GitCommandLog;
 
   constructor(
@@ -114,10 +119,23 @@ export class TaskReviewService implements TaskReviewer {
     private readonly clock: Clock = systemClock,
   ) {
     this.repositoryLock = new RepositoryLock(paths);
+    this.operationLocks = new FileLockManager(paths.locksDirectory);
     this.gitLog = new GitCommandLog(paths);
   }
 
   async review(taskId: string, overrides: TaskReviewOverrides = {}): Promise<TaskReviewReport> {
+    const operationLock = await this.operationLocks.acquire(`task-operation:${taskId}`);
+    try {
+      return await this.reviewLocked(taskId, overrides);
+    } finally {
+      await operationLock.release();
+    }
+  }
+
+  private async reviewLocked(
+    taskId: string,
+    overrides: TaskReviewOverrides,
+  ): Promise<TaskReviewReport> {
     let task = await this.tasks.get(taskId);
     let state = await this.tasks.getState(taskId);
     if (
@@ -131,6 +149,9 @@ export class TaskReviewService implements TaskReviewer {
       });
     }
     const lock = await this.repositoryLock.acquireWriter(task.projectId);
+    const callerSignal = overrides.abortSignal;
+    const cancellation = new PersistedTaskCancellation(this.tasks, taskId, callerSignal);
+    overrides = { ...overrides, abortSignal: cancellation.signal };
     try {
       const project = await this.projects.inspect(task.projectId);
       const diagnosis = await this.diagnoses.read(project.id, task.id);
@@ -179,6 +200,12 @@ export class TaskReviewService implements TaskReviewer {
       const reviewResults: ReviewResult[] = [];
       const corrections: ExecutionAttempt[] = [];
       const maximumCycles = config.profiles[profile].maxReviewCycles;
+      const priorReviewCycles = (await this.executions.list(project.id, task.id)).filter(
+        (attempt) => attempt.phase === "review",
+      ).length;
+      if (priorReviewCycles >= maximumCycles) {
+        return this.stopTask(task, state, "review_cycle_limit_reached");
+      }
       const persistedOverrides = Object.fromEntries(
         Object.entries(overrides).filter(
           ([key, value]) => key !== "abortSignal" && value !== undefined,
@@ -192,7 +219,7 @@ export class TaskReviewService implements TaskReviewer {
         });
       }
 
-      for (let cycle = 1; cycle <= maximumCycles; cycle += 1) {
+      for (let cycle = priorReviewCycles + 1; cycle <= maximumCycles; cycle += 1) {
         if (overrides.abortSignal?.aborted ?? false) {
           throw new OrchestratorError("Task review was cancelled", { code: "CANCELLED" });
         }
@@ -378,9 +405,16 @@ export class TaskReviewService implements TaskReviewer {
       }
       return this.stopTask(task, state, "review_cycle_limit_reached");
     } catch (error) {
-      const normalized = toOrchestratorError(error);
+      let normalized = toOrchestratorError(error);
       task = await this.tasks.get(task.id);
       state = await this.tasks.getState(task.id);
+      if (state.status === "cancelled" && normalized.code !== "CANCELLED") {
+        normalized = new OrchestratorError("Task review was cancelled", {
+          code: "CANCELLED",
+          resumable: true,
+          cause: error,
+        });
+      }
       if (["reviewing", "correcting", "verifying"].includes(state.status)) {
         ({ task, state } = await this.transition(
           task,
@@ -391,6 +425,7 @@ export class TaskReviewService implements TaskReviewer {
       }
       throw normalized;
     } finally {
+      cancellation.dispose(callerSignal);
       await lock.release();
     }
   }
@@ -416,6 +451,11 @@ export class TaskReviewService implements TaskReviewer {
   }> {
     const executionId = randomUUID();
     const worktreeHead = await this.scopedGit(input.task).resolveCommit(input.worktreePath, "HEAD");
+    const selectedSkills = await this.skillRegistry.select({
+      phase: "review",
+      task: input.task,
+      project: input.project,
+    });
     const pack = new ContextPackBuilder(input.config).build({
       phase: "review",
       objective: `Independently review the exact diff for ${input.task.title}`,
@@ -431,6 +471,7 @@ export class TaskReviewService implements TaskReviewer {
       relevantFiles: input.diff.changedFiles,
       confirmedFacts: input.diagnosis.confirmedFacts.map((fact) => fact.statement),
       confirmedCauses: input.diagnosis.rootCauses.map((cause) => cause.statement),
+      selectedSkills,
       outputSchema: toJsonSchema(reviewResultSchema),
     });
     await this.integrity.assertLiveInstructionFiles(pack, {
@@ -523,7 +564,14 @@ export class TaskReviewService implements TaskReviewer {
       await this.usage
         .releaseReservation(input.project.id, input.task.id, setup.reservationId)
         .catch(() => undefined);
-      const normalized = toOrchestratorError(error);
+      let normalized = toOrchestratorError(error);
+      if (input.overrides.abortSignal?.aborted ?? false) {
+        normalized = new OrchestratorError("Task review was cancelled", {
+          code: "CANCELLED",
+          resumable: true,
+          cause: error,
+        });
+      }
       execution = {
         ...execution,
         completedAt: isoNow(this.clock),
@@ -570,6 +618,11 @@ export class TaskReviewService implements TaskReviewer {
       ),
       scopeAssessment: input.review.scopeAssessment,
     };
+    const selectedSkills = await this.skillRegistry.select({
+      phase: "correction",
+      task: input.task,
+      project: input.project,
+    });
     const pack = new ContextPackBuilder(input.config).build({
       phase: "correction",
       objective: `Correct focused independent-review findings for ${input.task.title}`,
@@ -589,6 +642,7 @@ export class TaskReviewService implements TaskReviewer {
       confirmedFacts: input.diagnosis.confirmedFacts.map((fact) => fact.statement),
       confirmedCauses: input.diagnosis.rootCauses.map((cause) => cause.statement),
       latestFailure: stableJson(focusedReview),
+      selectedSkills,
       outputSchema: toJsonSchema(implementationResultSchema),
     });
     await this.integrity.assertLiveInstructionFiles(pack, {
@@ -700,7 +754,14 @@ export class TaskReviewService implements TaskReviewer {
       await this.usage
         .releaseReservation(input.project.id, input.task.id, setup.reservationId)
         .catch(() => undefined);
-      const normalized = toOrchestratorError(error);
+      let normalized = toOrchestratorError(error);
+      if (input.overrides.abortSignal?.aborted ?? false) {
+        normalized = new OrchestratorError("Task review correction was cancelled", {
+          code: "CANCELLED",
+          resumable: true,
+          cause: error,
+        });
+      }
       execution = {
         ...execution,
         completedAt: isoNow(this.clock),

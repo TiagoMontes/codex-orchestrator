@@ -14,7 +14,8 @@ import { ProjectFileRepository } from "../infrastructure/persistence/project-fil
 import { registerProjectCommands } from "./commands/project.command.js";
 import type { TaskManager } from "../application/tasks/task-service.js";
 import { TaskService } from "../application/tasks/task-service.js";
-import { DeterministicTaskNormalizer } from "../application/tasks/deterministic-task-normalizer.js";
+import { CodexTaskNormalizer } from "../application/tasks/codex-task-normalizer.js";
+import type { TaskNormalizer } from "../application/tasks/task-normalizer.js";
 import { TaskFileRepository } from "../infrastructure/persistence/task-file-repository.js";
 import { registerTaskCreateCommand } from "./commands/task-create.command.js";
 import { registerTaskQueryCommands } from "./commands/task-query.command.js";
@@ -42,6 +43,13 @@ import { ProjectAuditService } from "../application/auditing/project-audit-servi
 import type { ProjectRefresher } from "../application/auditing/project-refresh-service.js";
 import { ProjectRefreshService } from "../application/auditing/project-refresh-service.js";
 import { AuditArtifactRepository } from "../infrastructure/persistence/audit-artifact-repository.js";
+import type { TaskReporter } from "../application/tasks/task-reporting-service.js";
+import { TaskReportingService } from "../application/tasks/task-reporting-service.js";
+import type { TaskController } from "../application/tasks/task-control-service.js";
+import { TaskControlService } from "../application/tasks/task-control-service.js";
+import type { TaskCleaner } from "../application/tasks/task-cleanup-service.js";
+import { TaskCleanupService } from "../application/tasks/task-cleanup-service.js";
+import { registerTaskOperationCommands } from "./commands/task-operations.command.js";
 
 export type ProgramDependencies = {
   output?: OutputWriter;
@@ -55,6 +63,10 @@ export type ProgramDependencies = {
   projectAuditService?: ProjectAuditor;
   projectRefreshService?: ProjectRefresher;
   codexRuntime?: CodexRuntime;
+  taskNormalizer?: TaskNormalizer;
+  taskReporter?: TaskReporter;
+  taskController?: TaskController;
+  taskCleaner?: TaskCleaner;
 };
 
 export function createProgram(dependencies: ProgramDependencies = {}): Command {
@@ -62,17 +74,35 @@ export function createProgram(dependencies: ProgramDependencies = {}): Command {
   const configService = dependencies.configService ?? new ConfigService();
   const doctorService = dependencies.doctorService ?? new DoctorService(configService);
   const projectRepository = new ProjectFileRepository(configService.paths);
-  const projectService = dependencies.projectService ?? new ProjectService(projectRepository);
   const taskRepository = new TaskFileRepository(configService.paths);
-  const taskService =
-    dependencies.taskService ??
-    new TaskService(taskRepository, projectService, new DeterministicTaskNormalizer());
+  const projectService =
+    dependencies.projectService ??
+    new ProjectService(
+      projectRepository,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      taskRepository,
+    );
   const codexRuntime = dependencies.codexRuntime ?? new CodexSdkRuntime();
   const usageRepository = new UsageFileRepository(configService.paths);
-  const diagnosisRepository = new DiagnosisFileRepository(configService.paths);
-  const evidenceRepository = new EvidenceFileRepository(configService.paths);
   const executionRepository = new ExecutionFileRepository(configService.paths);
   const decisionRepository = new DecisionFileRepository(configService.paths);
+  const taskNormalizer =
+    dependencies.taskNormalizer ??
+    new CodexTaskNormalizer(
+      configService,
+      configService.paths,
+      codexRuntime,
+      usageRepository,
+      executionRepository,
+      decisionRepository,
+    );
+  const taskService =
+    dependencies.taskService ?? new TaskService(taskRepository, projectService, taskNormalizer);
+  const diagnosisRepository = new DiagnosisFileRepository(configService.paths);
+  const evidenceRepository = new EvidenceFileRepository(configService.paths);
   const verificationRepository = new VerificationFileRepository(configService.paths);
   const reviewRepository = new ReviewFileRepository(configService.paths);
   const auditRepository = new AuditArtifactRepository(configService.paths);
@@ -108,6 +138,35 @@ export function createProgram(dependencies: ProgramDependencies = {}): Command {
     projectService,
     diagnosisRepository,
   );
+  const taskReporter =
+    dependencies.taskReporter ??
+    new TaskReportingService(
+      configService.paths,
+      taskRepository,
+      diagnosisRepository,
+      executionRepository,
+      usageRepository,
+      verificationRepository,
+      reviewRepository,
+      decisionRepository,
+    );
+  const taskController =
+    dependencies.taskController ??
+    new TaskControlService(
+      configService.paths,
+      taskRepository,
+      projectService,
+      diagnosisRepository,
+      verificationRepository,
+    );
+  const taskCleaner =
+    dependencies.taskCleaner ??
+    new TaskCleanupService(
+      configService.paths,
+      taskRepository,
+      executionRepository,
+      taskWorktreeService,
+    );
   const taskRunService =
     dependencies.taskRunService ??
     new TaskRunService(
@@ -150,7 +209,10 @@ export function createProgram(dependencies: ProgramDependencies = {}): Command {
     .option("--json", "emit machine-readable JSON", false)
     .configureOutput({
       writeOut: (message) => output.write(message.trimEnd()),
-      writeErr: (message) => output.writeError(message.trimEnd()),
+      writeErr: (message) => {
+        const jsonRequested = program.opts<{ json?: boolean }>().json === true;
+        if (!jsonRequested) output.writeError(message.trimEnd());
+      },
     })
     .showHelpAfterError()
     .exitOverride((error) => {
@@ -172,10 +234,19 @@ export function createProgram(dependencies: ProgramDependencies = {}): Command {
   );
   const task = program.command("task").description("Create and orchestrate durable tasks");
   registerTaskCreateCommand(task, program, taskService, configService, output);
-  registerTaskQueryCommands(task, program, taskService, configService, output);
+  registerTaskQueryCommands(task, program, taskService, configService, output, taskReporter);
   registerTaskDiagnoseCommand(task, program, taskDiagnosisService, output);
   registerTaskRunCommand(task, program, taskRunService, output);
   registerTaskReviewCommand(task, program, taskReviewService, output);
+  registerTaskOperationCommands(
+    task,
+    program,
+    configService,
+    taskReporter,
+    taskController,
+    taskCleaner,
+    output,
+  );
 
   return program;
 }
