@@ -1,0 +1,6 @@
+dist
+coverage
+node_modules
+pnpm-lock.yaml
+CODEX_ORCHESTRATOR_MASTER_BUILD_SPEC.md
+tests/fixtures/**
