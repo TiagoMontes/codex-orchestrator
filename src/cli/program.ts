@@ -37,6 +37,11 @@ import type { TaskReviewer } from "../application/tasks/task-review-service.js";
 import { TaskReviewService } from "../application/tasks/task-review-service.js";
 import { ReviewFileRepository } from "../infrastructure/persistence/review-file-repository.js";
 import { registerTaskReviewCommand } from "./commands/task-review.command.js";
+import type { ProjectAuditor } from "../application/auditing/project-audit-service.js";
+import { ProjectAuditService } from "../application/auditing/project-audit-service.js";
+import type { ProjectRefresher } from "../application/auditing/project-refresh-service.js";
+import { ProjectRefreshService } from "../application/auditing/project-refresh-service.js";
+import { AuditArtifactRepository } from "../infrastructure/persistence/audit-artifact-repository.js";
 
 export type ProgramDependencies = {
   output?: OutputWriter;
@@ -47,6 +52,8 @@ export type ProgramDependencies = {
   taskDiagnosisService?: TaskDiagnosisManager;
   taskRunService?: TaskRunner;
   taskReviewService?: TaskReviewer;
+  projectAuditService?: ProjectAuditor;
+  projectRefreshService?: ProjectRefresher;
   codexRuntime?: CodexRuntime;
 };
 
@@ -54,9 +61,8 @@ export function createProgram(dependencies: ProgramDependencies = {}): Command {
   const output = dependencies.output ?? consoleOutput;
   const configService = dependencies.configService ?? new ConfigService();
   const doctorService = dependencies.doctorService ?? new DoctorService(configService);
-  const projectService =
-    dependencies.projectService ??
-    new ProjectService(new ProjectFileRepository(configService.paths));
+  const projectRepository = new ProjectFileRepository(configService.paths);
+  const projectService = dependencies.projectService ?? new ProjectService(projectRepository);
   const taskRepository = new TaskFileRepository(configService.paths);
   const taskService =
     dependencies.taskService ??
@@ -69,6 +75,19 @@ export function createProgram(dependencies: ProgramDependencies = {}): Command {
   const decisionRepository = new DecisionFileRepository(configService.paths);
   const verificationRepository = new VerificationFileRepository(configService.paths);
   const reviewRepository = new ReviewFileRepository(configService.paths);
+  const auditRepository = new AuditArtifactRepository(configService.paths);
+  const projectRefreshService =
+    dependencies.projectRefreshService ??
+    new ProjectRefreshService(projectService, projectRepository, auditRepository);
+  const projectAuditService =
+    dependencies.projectAuditService ??
+    new ProjectAuditService(
+      configService,
+      configService.paths,
+      projectRefreshService,
+      codexRuntime,
+      auditRepository,
+    );
   const taskDiagnosisService =
     dependencies.taskDiagnosisService ??
     new TaskDiagnosisService(
@@ -143,7 +162,14 @@ export function createProgram(dependencies: ProgramDependencies = {}): Command {
 
   registerConfigCommand(program, configService, output);
   registerDoctorCommand(program, doctorService, output);
-  registerProjectCommands(program, projectService, configService, output);
+  registerProjectCommands(
+    program,
+    projectService,
+    configService,
+    output,
+    projectAuditService,
+    projectRefreshService,
+  );
   const task = program.command("task").description("Create and orchestrate durable tasks");
   registerTaskCreateCommand(task, program, taskService, configService, output);
   registerTaskQueryCommands(task, program, taskService, configService, output);

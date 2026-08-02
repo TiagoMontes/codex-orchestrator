@@ -118,6 +118,27 @@ export class GitClient {
     return this.run(gitRoot, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
   }
 
+  async listFilesAtCommit(gitRoot: string, commit: string): Promise<string[]> {
+    const resolved = await this.resolveCommit(gitRoot, commit);
+    return splitNul(await this.run(gitRoot, ["ls-tree", "-r", "--name-only", "-z", resolved]));
+  }
+
+  async showFileAtCommit(gitRoot: string, commit: string, path: string): Promise<string> {
+    assertSafeGitPath(path);
+    const resolved = await this.resolveCommit(gitRoot, commit);
+    return this.run(gitRoot, ["show", `${resolved}:${path}`]);
+  }
+
+  async changedFilesBetween(
+    gitRoot: string,
+    fromCommit: string,
+    toCommit: string,
+  ): Promise<string[]> {
+    const from = await this.resolveCommit(gitRoot, fromCommit);
+    const to = await this.resolveCommit(gitRoot, toCommit);
+    return splitNul(await this.run(gitRoot, ["diff", "--name-only", "-z", from, to, "--"]));
+  }
+
   async branchExists(gitRoot: string, branch: string): Promise<boolean> {
     return this.refExists(gitRoot, `refs/heads/${branch}`);
   }
@@ -296,6 +317,7 @@ export class GitClient {
       reject: false,
       timeout: 15_000,
       maxBuffer: 8_000_000,
+      stripFinalNewline: false,
     });
     await this.options.observer?.({
       cwd: gitRoot,
@@ -311,6 +333,19 @@ export class GitClient {
 
 function splitNul(value: string): string[] {
   return value.split("\0").filter((part) => part !== "");
+}
+
+function assertSafeGitPath(path: string): void {
+  if (
+    path === "" ||
+    path.startsWith("/") ||
+    path.includes("\\") ||
+    path.split("/").some((segment) => segment === "" || segment === "." || segment === "..")
+  ) {
+    throw new OrchestratorError(`Unsafe repository-relative Git path: ${path}`, {
+      code: "CONTEXT_INTEGRITY",
+    });
+  }
 }
 
 function parseWorktreeList(output: string): GitWorktree[] {

@@ -54,6 +54,10 @@ export class StatePaths {
     return join(this.projectsDirectory, assertSafeId(projectId));
   }
 
+  knowledgeDirectory(projectId: string): string {
+    return join(this.projectDirectory(projectId), "knowledge");
+  }
+
   taskDirectory(projectId: string, taskId: string): string {
     return join(this.projectDirectory(projectId), "tasks", assertSafeId(taskId));
   }
