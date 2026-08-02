@@ -26,6 +26,14 @@ export class StatePaths {
     return join(this.home, "projects.json");
   }
 
+  get tasksIndexFile(): string {
+    return join(this.home, "tasks.json");
+  }
+
+  get taskCountersFile(): string {
+    return join(this.home, "task-counters.json");
+  }
+
   get projectsDirectory(): string {
     return join(this.home, "projects");
   }
