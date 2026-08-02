@@ -15,6 +15,7 @@
   "files": [
     "dist",
     "templates",
+    "prompts",
     "skills",
     "README.md",
     "LICENSE"

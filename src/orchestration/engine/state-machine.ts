@@ -3,13 +3,13 @@ import type { TaskStatus } from "../../domain/task/task.js";
 import { OrchestratorError } from "../../shared/errors.js";
 
 const ALLOWED_TRANSITIONS: Readonly<Record<TaskStatus, readonly TaskStatus[]>> = {
-  created: ["normalizing", "cancelled", "failed"],
-  normalizing: ["ready-for-diagnosis", "failed", "cancelled"],
-  "ready-for-diagnosis": ["diagnosing", "cancelled", "failed"],
+  created: ["normalizing", "blocked", "cancelled", "failed"],
+  normalizing: ["ready-for-diagnosis", "blocked", "failed", "cancelled"],
+  "ready-for-diagnosis": ["diagnosing", "blocked", "cancelled", "failed"],
   diagnosing: ["diagnosed", "blocked", "failed", "cancelled"],
-  diagnosed: ["worktree-preparing", "cancelled", "failed"],
+  diagnosed: ["worktree-preparing", "blocked", "cancelled", "failed"],
   "worktree-preparing": ["ready-for-implementation", "blocked", "failed", "cancelled"],
-  "ready-for-implementation": ["implementing", "cancelled", "failed"],
+  "ready-for-implementation": ["implementing", "blocked", "cancelled", "failed"],
   implementing: ["verifying", "blocked", "failed", "cancelled"],
   verifying: ["implementing", "reviewing", "blocked", "failed", "cancelled"],
   reviewing: ["completed", "correcting", "blocked", "failed", "cancelled"],

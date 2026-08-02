@@ -18,6 +18,16 @@ import { DeterministicTaskNormalizer } from "../application/tasks/deterministic-
 import { TaskFileRepository } from "../infrastructure/persistence/task-file-repository.js";
 import { registerTaskCreateCommand } from "./commands/task-create.command.js";
 import { registerTaskQueryCommands } from "./commands/task-query.command.js";
+import type { TaskDiagnosisManager } from "../application/tasks/task-diagnosis-service.js";
+import { TaskDiagnosisService } from "../application/tasks/task-diagnosis-service.js";
+import { CodexSdkRuntime } from "../infrastructure/codex/codex-sdk-runtime.js";
+import type { CodexRuntime } from "../infrastructure/codex/codex-runtime.js";
+import { UsageFileRepository } from "../infrastructure/persistence/usage-file-repository.js";
+import { DiagnosisFileRepository } from "../infrastructure/persistence/diagnosis-file-repository.js";
+import { EvidenceFileRepository } from "../infrastructure/persistence/evidence-file-repository.js";
+import { ExecutionFileRepository } from "../infrastructure/persistence/execution-file-repository.js";
+import { DecisionFileRepository } from "../infrastructure/persistence/decision-file-repository.js";
+import { registerTaskDiagnoseCommand } from "./commands/task-diagnose.command.js";
 
 export type ProgramDependencies = {
   output?: OutputWriter;
@@ -25,6 +35,8 @@ export type ProgramDependencies = {
   doctorService?: DoctorRunner;
   projectService?: ProjectManager;
   taskService?: TaskManager;
+  taskDiagnosisService?: TaskDiagnosisManager;
+  codexRuntime?: CodexRuntime;
 };
 
 export function createProgram(dependencies: ProgramDependencies = {}): Command {
@@ -34,12 +46,24 @@ export function createProgram(dependencies: ProgramDependencies = {}): Command {
   const projectService =
     dependencies.projectService ??
     new ProjectService(new ProjectFileRepository(configService.paths));
+  const taskRepository = new TaskFileRepository(configService.paths);
   const taskService =
     dependencies.taskService ??
-    new TaskService(
-      new TaskFileRepository(configService.paths),
+    new TaskService(taskRepository, projectService, new DeterministicTaskNormalizer());
+  const codexRuntime = dependencies.codexRuntime ?? new CodexSdkRuntime();
+  const taskDiagnosisService =
+    dependencies.taskDiagnosisService ??
+    new TaskDiagnosisService(
+      configService,
+      configService.paths,
+      taskRepository,
       projectService,
-      new DeterministicTaskNormalizer(),
+      codexRuntime,
+      new UsageFileRepository(configService.paths),
+      new DiagnosisFileRepository(configService.paths),
+      new EvidenceFileRepository(configService.paths),
+      new ExecutionFileRepository(configService.paths),
+      new DecisionFileRepository(configService.paths),
     );
   const program = new Command();
 
@@ -67,6 +91,7 @@ export function createProgram(dependencies: ProgramDependencies = {}): Command {
   const task = program.command("task").description("Create and orchestrate durable tasks");
   registerTaskCreateCommand(task, program, taskService, configService, output);
   registerTaskQueryCommands(task, program, taskService, configService, output);
+  registerTaskDiagnoseCommand(task, program, taskDiagnosisService, output);
 
   return program;
 }
