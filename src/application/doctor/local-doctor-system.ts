@@ -1,5 +1,5 @@
-import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { execa } from "execa";
 import { z } from "zod";
@@ -65,8 +65,7 @@ export class LocalDoctorSystem {
 
   private async checkCodexSdk(): Promise<DoctorCheck> {
     try {
-      const require = createRequire(import.meta.url);
-      const entry = require.resolve("@openai/codex-sdk");
+      const entry = fileURLToPath(import.meta.resolve("@openai/codex-sdk"));
       const metadataPath = join(dirname(entry), "..", "package.json");
       const metadata = packageMetadataSchema.parse(
         JSON.parse(await readFile(metadataPath, "utf8")) as unknown,
