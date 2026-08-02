@@ -237,9 +237,8 @@ export class CodexSdkRuntime implements CodexRuntime {
       modelReasoningEffort: effort,
       sandboxMode: request.sandboxMode,
       workingDirectory: request.workingDirectory,
-      // Normalization runs only in state-owned storage and never inspects a target repository.
-      // Every target-backed role keeps the SDK Git safety check enabled.
-      skipGitRepoCheck: request.role === "normalizer",
+      // Every phase is anchored to a registered repository or task worktree.
+      skipGitRepoCheck: false,
       networkAccessEnabled: request.networkAccessEnabled,
       webSearchMode: "disabled",
       approvalPolicy: "never",

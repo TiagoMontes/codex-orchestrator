@@ -197,6 +197,110 @@ describe("task review", () => {
     expect(calls).toBe(0);
     expect((await seeded.taskRepository.getState(seeded.task.id)).status).toBe("blocked");
   });
+
+  it("finalizes a correction execution when cancellation interrupts deterministic verification", async () => {
+    const fixture = await mkdtemp(join(tmpdir(), "cxo-review-cancel-fixture-"));
+    const stateHome = await mkdtemp(join(tmpdir(), "cxo-review-cancel-state-"));
+    temporaryDirectories.push(fixture, stateHome);
+    await createGitFixture(fixture);
+    const seeded = await createImplementedTaskFixture(fixture, stateHome);
+    const controller = new AbortController();
+    const evidenceId =
+      (await new VerificationFileRepository(seeded.paths).read(seeded.project.id, seeded.task.id))
+        .commands[0]?.evidenceId ?? "E1";
+    const runtime: CodexRuntime = {
+      runStructured: async (request) => {
+        if (request.role === "corrector") {
+          await writeFile(
+            join(request.workingDirectory, "index.js"),
+            "// preserve export invariant\nexport const publicValue = 2;\n",
+            "utf8",
+          );
+          await writeFile(
+            join(request.workingDirectory, "test", "index.test.js"),
+            'import test from "node:test";\ntest("wait for cancellation", async () => new Promise(() => {}));\n',
+            "utf8",
+          );
+          const timer = setTimeout(() => controller.abort(new Error("fixture cancellation")), 50);
+          timer.unref();
+          return agentResponse(
+            request,
+            {
+              schemaVersion: 1,
+              taskId: seeded.task.id,
+              status: "changed",
+              summary: "Applied focused review correction",
+              advisoryChangedFiles: ["index.js", "test/index.test.js"],
+              testsAddedOrUpdated: ["test/index.test.js"],
+              unresolvedRisks: [],
+              completedAt: "2026-08-02T12:05:00.000Z",
+            },
+            "cancelled-correction-thread",
+          );
+        }
+        const diff = await new DiffService(seeded.paths).read(seeded.project.id, seeded.task.id);
+        return agentResponse(
+          request,
+          {
+            schemaVersion: 1,
+            taskId: seeded.task.id,
+            sourceCommit: seeded.sourceCommit,
+            reviewedDiffHash: diff.diffHash,
+            verdict: "changes-requested",
+            findings: [
+              {
+                id: "F-CANCEL",
+                severity: "medium",
+                category: "contract",
+                title: "Clarify the export invariant",
+                explanation: "The protected export needs a focused invariant comment.",
+                file: "index.js",
+                startLine: 1,
+                endLine: 1,
+                evidenceIds: ["E1"],
+                recommendation: "Add the invariant comment.",
+              },
+            ],
+            acceptanceCriteriaAssessment: seeded.task.acceptanceCriteria.map((criterion) => ({
+              criterionId: criterion.id,
+              status: "not-met",
+              evidenceIds: [evidenceId],
+              explanation: "A focused correction remains.",
+            })),
+            scopeAssessment: {
+              withinScope: true,
+              unexpectedFiles: [],
+              explanation: "The requested correction is localized.",
+            },
+            createdAt: "2026-08-02T12:04:00.000Z",
+          },
+          "cancel-reviewer-thread",
+        );
+      },
+    };
+
+    await expect(
+      createReviewService(seeded, runtime).review(seeded.task.id, {
+        abortSignal: controller.signal,
+      }),
+    ).rejects.toMatchObject({ code: "CANCELLED", resumable: true });
+
+    const attempts = await new ExecutionFileRepository(seeded.paths).list(
+      seeded.project.id,
+      seeded.task.id,
+    );
+    const correction = attempts.find(
+      (attempt) =>
+        attempt.phase === "correction" && attempt.threadId === "cancelled-correction-thread",
+    );
+    expect(correction).toMatchObject({ status: "cancelled" });
+    expect(correction?.completedAt).toBeDefined();
+    expect(attempts.some((attempt) => attempt.status === "running")).toBe(false);
+    expect((await seeded.taskRepository.getState(seeded.task.id)).status).toBe("cancelled");
+    expect(
+      (await new UsageFileRepository(seeded.paths).read("demo", seeded.task.id)).reservations,
+    ).toEqual([]);
+  });
 });
 
 type Implemented = Awaited<ReturnType<typeof createImplementedTaskFixture>>;

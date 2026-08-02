@@ -17,6 +17,7 @@ import {
   KnowledgeFreshnessService,
   type KnowledgeFreshnessAssessment,
 } from "./knowledge-freshness-service.js";
+import { SkillRegistry } from "../skills/skill-registry.js";
 
 export type ProjectRefreshReport = {
   project: Project;
@@ -29,6 +30,8 @@ export interface ProjectRefresher {
 }
 
 export class ProjectRefreshService implements ProjectRefresher {
+  private readonly skillRegistry = new SkillRegistry();
+
   constructor(
     private readonly projects: ProjectManager,
     private readonly projectRepository: ProjectFileRepository,
@@ -95,6 +98,14 @@ export class ProjectRefreshService implements ProjectRefresher {
         path: item.relativePath,
         sha256: item.sha256,
       })),
+      selectedSkills: (await this.skillRegistry.select({ phase: "audit", project })).map(
+        ({ name, source, sha256, instructionsSha256 }) => ({
+          name,
+          source,
+          sha256,
+          instructionsSha256,
+        }),
+      ),
       changedFiles,
     });
     const timestamp = isoNow(this.clock);
@@ -102,10 +113,6 @@ export class ProjectRefreshService implements ProjectRefresher {
     const refreshed = await this.artifacts.save(project.id, refreshedArtifacts, {
       ...generation.manifest,
       currentHeadCommit: gitMetadata.headCommit,
-      instructionHashes: metadata.instructionFiles.map((item) => ({
-        path: item.relativePath,
-        sha256: item.sha256,
-      })),
       artifactHashes: artifactHashes(refreshedArtifacts),
       stale: assessment.stale,
       staleReason: assessment.reason,

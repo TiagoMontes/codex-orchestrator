@@ -94,4 +94,35 @@ describe("ContextBudgetManager", () => {
       }),
     ).rejects.toMatchObject({ code: "BUDGET" });
   });
+
+  it("reserves worst-case token capacity for fallback or output repair", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "cxo-budget-"));
+    temporaryDirectories.push(directory);
+    const usage = new UsageFileRepository(new StatePaths({ CODEX_ORCHESTRATOR_HOME: directory }));
+    const config = {
+      ...DEFAULT_CONFIG,
+      context: { ...DEFAULT_CONFIG.context, reservedOutputTokens: 1_000 },
+      profiles: {
+        ...DEFAULT_CONFIG.profiles,
+        balanced: {
+          ...DEFAULT_CONFIG.profiles.balanced,
+          maxTotalTokens: 3_999,
+          maxAgentCalls: 2,
+        },
+      },
+    };
+
+    await expect(
+      new ContextBudgetManager(config, usage).admitAndReserve({
+        projectId: "demo",
+        taskId: "BUG-2026-0001",
+        phase: "diagnosis",
+        profile: "balanced",
+        estimatedInputTokens: 1_000,
+        activeParallelReaders: 0,
+        projectedAgentCalls: 2,
+      }),
+    ).rejects.toMatchObject({ code: "BUDGET" });
+    expect((await usage.read("demo", "BUG-2026-0001")).reservations).toEqual([]);
+  });
 });

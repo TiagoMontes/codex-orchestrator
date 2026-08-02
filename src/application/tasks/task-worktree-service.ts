@@ -17,6 +17,7 @@ import { isoNow, systemClock } from "../../shared/clock.js";
 import { OrchestratorError, toOrchestratorError } from "../../shared/errors.js";
 import { TaskStateMachine } from "../../orchestration/engine/state-machine.js";
 import type { ProjectManager } from "../projects/project-service.js";
+import { taskFailureStatus } from "./task-failure-policy.js";
 
 export type WorktreePreparationReport = {
   task: Task;
@@ -159,15 +160,16 @@ export class TaskWorktreeService {
       }
       if (state.status === "worktree-preparing") {
         const blockedAt = isoNow(this.clock);
+        const nextStatus = taskFailureStatus(normalized);
         state = this.stateMachine.transition(state, {
-          nextState: "blocked",
+          nextState: nextStatus,
           timestamp: blockedAt,
           reason: normalized.message,
           actor: "system",
         });
         task = {
           ...task,
-          status: "blocked",
+          status: nextStatus,
           revision: task.revision + 1,
           updatedAt: blockedAt,
         };

@@ -21,9 +21,22 @@ const ALLOWED_TRANSITIONS: Readonly<Record<TaskStatus, readonly TaskStatus[]>> =
   reviewing: ["completed", "correcting", "blocked", "failed", "cancelled"],
   correcting: ["verifying", "blocked", "failed", "cancelled"],
   completed: [],
-  blocked: ["ready-for-diagnosis", "ready-for-implementation", "reviewing", "cancelled", "failed"],
+  blocked: [
+    "normalizing",
+    "ready-for-diagnosis",
+    "ready-for-implementation",
+    "reviewing",
+    "cancelled",
+    "failed",
+  ],
   failed: [],
-  cancelled: ["ready-for-diagnosis", "ready-for-implementation", "reviewing"],
+  cancelled: [
+    "normalizing",
+    "ready-for-diagnosis",
+    "ready-for-implementation",
+    "reviewing",
+    "failed",
+  ],
 };
 
 export type TransitionInput = Omit<TaskTransition, "previousState" | "timestamp"> & {

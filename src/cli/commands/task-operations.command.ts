@@ -97,7 +97,11 @@ export function registerTaskOperationCommands(
   task
     .command("cleanup")
     .argument("<task-id>")
-    .option("--remove-worktree", "remove a clean inactive task worktree", false)
+    .option(
+      "--remove-worktree",
+      "remove an inactive task worktree after preserving and validating its recovery patch",
+      false,
+    )
     .option("--delete-branch", "also delete the branch after merged-ancestry checks", false)
     .description("Inspect or explicitly clean safe task worktree resources")
     .action(
@@ -108,11 +112,14 @@ export function registerTaskOperationCommands(
         else if (report.dryRun) {
           output.write(
             report.hasWorktree
-              ? `Dry run: worktree ${report.worktreePath}; pass --remove-worktree to remove it when clean`
+              ? `Dry run: worktree ${report.worktreePath}; pass --remove-worktree to remove it safely${report.abandonsTask ? " and mark the task failed" : ""}`
               : "Dry run: task has no worktree",
           );
         } else {
           output.write(`Removed worktree ${report.worktreePath}`);
+          if (report.recoveryPatchPath !== undefined) {
+            output.write(`Recovery patch: ${report.recoveryPatchPath}`);
+          }
           output.write(`Branch deleted: ${report.branchDeleted}`);
         }
       },

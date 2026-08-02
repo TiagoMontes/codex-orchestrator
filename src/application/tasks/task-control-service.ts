@@ -13,6 +13,8 @@ import { isoNow, systemClock } from "../../shared/clock.js";
 import { OrchestratorError } from "../../shared/errors.js";
 import { TaskStateMachine } from "../../orchestration/engine/state-machine.js";
 import { FileLockManager } from "../../infrastructure/persistence/file-lock.js";
+import type { UsageFileRepository } from "../../infrastructure/persistence/usage-file-repository.js";
+import type { ExecutionFileRepository } from "../../infrastructure/persistence/execution-file-repository.js";
 
 export type TaskControlReport = {
   task: Task;
@@ -24,6 +26,10 @@ export type TaskControlReport = {
 export interface TaskController {
   cancel(taskId: string): Promise<TaskControlReport>;
   resume(taskId: string): Promise<TaskControlReport>;
+}
+
+export interface TaskNormalizationResumer {
+  resumeNormalization(taskId: string): Promise<{ task: Task }>;
 }
 
 export class TaskControlService implements TaskController {
@@ -38,6 +44,9 @@ export class TaskControlService implements TaskController {
     private readonly diagnoses: DiagnosisFileRepository,
     private readonly verification: VerificationFileRepository,
     private readonly clock: Clock = systemClock,
+    private readonly normalizationResumer?: TaskNormalizationResumer,
+    private readonly usage?: UsageFileRepository,
+    private readonly executions?: ExecutionFileRepository,
   ) {
     this.operationLocks = new FileLockManager(paths.locksDirectory);
   }
@@ -70,6 +79,26 @@ export class TaskControlService implements TaskController {
   }
 
   async resume(taskId: string): Promise<TaskControlReport> {
+    const initialState = await this.tasks.getState(taskId);
+    if (
+      (initialState.status === "blocked" || initialState.status === "cancelled") &&
+      (initialState.resumableFrom === "normalizing" || initialState.resumableFrom === "created")
+    ) {
+      if (this.normalizationResumer === undefined) {
+        throw new OrchestratorError("Normalization resume service is unavailable", {
+          code: "TASK_STATE",
+          resumable: true,
+        });
+      }
+      const result = await this.normalizationResumer.resumeNormalization(taskId);
+      const state = await this.tasks.getState(taskId);
+      return {
+        task: result.task,
+        state,
+        nextCommand: `cxo task diagnose ${taskId}`,
+        idempotent: false,
+      };
+    }
     const operationLock = await this.operationLocks.acquire(`task-operation:${taskId}`);
     try {
       return await this.resumeLocked(taskId);
@@ -93,6 +122,8 @@ export class TaskControlService implements TaskController {
         code: "TASK_STATE",
       });
     }
+    await this.reconcileInterruptedExecutions(task, state.status);
+    await this.usage?.releaseAllReservations(task.projectId, task.id);
     const target = resumeTarget(origin);
     const nextCommand = await this.assertResumeIntegrity(task, target);
     return this.transition(task, state, target, `User resumed task from ${origin}`, {
@@ -175,6 +206,29 @@ export class TaskControlService implements TaskController {
     await this.tasks.update(updated, next);
     return { task: updated, state: next, ...report, idempotent: false };
   }
+
+  private async reconcileInterruptedExecutions(
+    task: Task,
+    status: "blocked" | "cancelled",
+  ): Promise<void> {
+    if (this.executions === undefined) return;
+    const timestamp = isoNow(this.clock);
+    for (const attempt of (await this.executions.list(task.projectId, task.id)).filter(
+      (candidate) => candidate.status === "running",
+    )) {
+      await this.executions.save(task.projectId, {
+        ...attempt,
+        completedAt: timestamp,
+        status,
+        error: {
+          name: "OrchestratorError",
+          message: "Interrupted execution reconciled at the safe resume boundary",
+          code: status === "cancelled" ? "CANCELLED" : "TASK_STATE",
+          resumable: true,
+        },
+      });
+    }
+  }
 }
 
 function isConcurrentUpdate(error: unknown): boolean {
@@ -186,7 +240,7 @@ function isConcurrentUpdate(error: unknown): boolean {
 }
 
 export function resumeTarget(origin: TaskStatus): TaskStatus {
-  if (["created", "normalizing", "ready-for-diagnosis", "diagnosing"].includes(origin)) {
+  if (["ready-for-diagnosis", "diagnosing"].includes(origin)) {
     return "ready-for-diagnosis";
   }
   if (

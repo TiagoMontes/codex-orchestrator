@@ -43,8 +43,9 @@ export class ContextBudgetManager {
         resumable: true,
       });
     }
-    const projectedTokens = input.estimatedInputTokens + this.config.context.reservedOutputTokens;
     const projectedAgentCalls = input.projectedAgentCalls ?? 1;
+    const projectedTokens =
+      (input.estimatedInputTokens + this.config.context.reservedOutputTokens) * projectedAgentCalls;
     const reservation = await this.usage.reserve({
       projectId: input.projectId,
       taskId: input.taskId,

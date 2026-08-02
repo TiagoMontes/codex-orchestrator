@@ -6,6 +6,8 @@ export type TaskNormalizationRequest = {
   projectId: string;
   profile: ExecutionProfile;
   originalFeedback: string;
+  workingDirectory: string;
+  abortSignal?: AbortSignal;
 };
 
 export interface TaskNormalizer {

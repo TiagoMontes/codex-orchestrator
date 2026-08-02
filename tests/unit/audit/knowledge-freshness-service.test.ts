@@ -11,6 +11,7 @@ describe("KnowledgeFreshnessService", () => {
         generation: generation(),
         currentHeadCommit: "source",
         instructionHashes: [{ path: "AGENTS.md", sha256: "a".repeat(64) }],
+        selectedSkills: selectedSkills(),
         changedFiles: [],
       }),
     ).toEqual({ stale: false, usable: true });
@@ -22,6 +23,7 @@ describe("KnowledgeFreshnessService", () => {
         generation: generation(),
         currentHeadCommit: "next",
         instructionHashes: [{ path: "AGENTS.md", sha256: "a".repeat(64) }],
+        selectedSkills: selectedSkills(),
         changedFiles: ["README.md"],
       }),
     ).toMatchObject({ stale: true, usable: true, validatedThroughCommit: "next" });
@@ -30,6 +32,7 @@ describe("KnowledgeFreshnessService", () => {
         generation: generation(),
         currentHeadCommit: "next",
         instructionHashes: [{ path: "AGENTS.md", sha256: "a".repeat(64) }],
+        selectedSkills: selectedSkills(),
         changedFiles: ["index.js"],
       }),
     ).toMatchObject({ stale: true, usable: false });
@@ -41,6 +44,19 @@ describe("KnowledgeFreshnessService", () => {
         generation: generation(),
         currentHeadCommit: "source",
         instructionHashes: [{ path: "AGENTS.md", sha256: "b".repeat(64) }],
+        selectedSkills: selectedSkills(),
+        changedFiles: [],
+      }),
+    ).toMatchObject({ stale: true, usable: false });
+  });
+
+  it("rejects changed selected skill content", () => {
+    expect(
+      service.assess({
+        generation: generation(),
+        currentHeadCommit: "source",
+        instructionHashes: [{ path: "AGENTS.md", sha256: "a".repeat(64) }],
+        selectedSkills: [{ ...selectedSkills()[0]!, instructionsSha256: "c".repeat(64) }],
         changedFiles: [],
       }),
     ).toMatchObject({ stale: true, usable: false });
@@ -124,6 +140,7 @@ function generation(): KnowledgeGeneration {
       sourceCommit: "source",
       currentHeadCommit: "source",
       instructionHashes: [{ path: "AGENTS.md", sha256: "a".repeat(64) }],
+      selectedSkills: selectedSkills(),
       artifactHashes: {
         repositoryMap: "1".repeat(64),
         architecture: "2".repeat(64),
@@ -135,4 +152,15 @@ function generation(): KnowledgeGeneration {
       updatedAt: common.generatedAt,
     },
   };
+}
+
+function selectedSkills() {
+  return [
+    {
+      name: "repository-audit",
+      source: "bundled" as const,
+      sha256: "6".repeat(64),
+      instructionsSha256: "7".repeat(64),
+    },
+  ];
 }

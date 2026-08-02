@@ -235,6 +235,18 @@ export const knowledgeManifestSchema = z
     instructionHashes: z.array(
       z.object({ path: z.string().min(1), sha256: z.string().regex(HASH) }).strict(),
     ),
+    selectedSkills: z
+      .array(
+        z
+          .object({
+            name: z.string().min(1),
+            source: z.enum(["bundled", "project", "user"]),
+            sha256: z.string().regex(HASH),
+            instructionsSha256: z.string().regex(HASH),
+          })
+          .strict(),
+      )
+      .default([]),
     artifactHashes: z
       .object({
         repositoryMap: z.string().regex(HASH),

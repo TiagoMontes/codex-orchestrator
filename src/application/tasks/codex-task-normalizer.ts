@@ -18,6 +18,7 @@ import { ContextBudgetManager } from "../../orchestration/context/context-budget
 import { ContextSizer } from "../../orchestration/context/context-sizer.js";
 import { ModelRouter } from "../../orchestration/routing/model-router.js";
 import type { TaskNormalizationRequest, TaskNormalizer } from "./task-normalizer.js";
+import { executionFailureStatus } from "./task-failure-policy.js";
 
 export class CodexTaskNormalizer implements TaskNormalizer {
   private readonly promptLoader = new PromptLoader();
@@ -115,7 +116,7 @@ export class CodexTaskNormalizer implements TaskNormalizer {
       const result = await this.runtime.runStructured({
         role: "normalizer",
         prompt,
-        workingDirectory: this.paths.taskDirectory(request.projectId, request.taskId),
+        workingDirectory: request.workingDirectory,
         model: decision.model,
         reasoningPreset: decision.reasoning,
         sandboxMode: "read-only",
@@ -125,6 +126,7 @@ export class CodexTaskNormalizer implements TaskNormalizer {
         outputValidator: taskDraftSchema,
         timeoutMs: config.runtime.defaultTimeoutSeconds * 1_000,
         eventsPath,
+        ...(request.abortSignal === undefined ? {} : { abortSignal: request.abortSignal }),
       });
       const draft = taskDraftSchema.parse(result.output);
       const resultPath = join(
@@ -161,7 +163,7 @@ export class CodexTaskNormalizer implements TaskNormalizer {
       execution = {
         ...execution,
         completedAt: isoNow(this.clock),
-        status: normalized.code === "CANCELLED" ? "cancelled" : "blocked",
+        status: executionFailureStatus(normalized),
         error: {
           name: normalized.name,
           message: normalized.message,

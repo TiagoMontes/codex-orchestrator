@@ -84,6 +84,7 @@ export function createProgram(dependencies: ProgramDependencies = {}): Command {
       undefined,
       undefined,
       taskRepository,
+      configService.paths,
     );
   const codexRuntime = dependencies.codexRuntime ?? new CodexSdkRuntime();
   const usageRepository = new UsageFileRepository(configService.paths);
@@ -100,7 +101,15 @@ export function createProgram(dependencies: ProgramDependencies = {}): Command {
       decisionRepository,
     );
   const taskService =
-    dependencies.taskService ?? new TaskService(taskRepository, projectService, taskNormalizer);
+    dependencies.taskService ??
+    new TaskService(
+      configService.paths,
+      taskRepository,
+      projectService,
+      taskNormalizer,
+      usageRepository,
+      executionRepository,
+    );
   const diagnosisRepository = new DiagnosisFileRepository(configService.paths);
   const evidenceRepository = new EvidenceFileRepository(configService.paths);
   const verificationRepository = new VerificationFileRepository(configService.paths);
@@ -158,6 +167,12 @@ export function createProgram(dependencies: ProgramDependencies = {}): Command {
       projectService,
       diagnosisRepository,
       verificationRepository,
+      undefined,
+      taskService.resumeNormalization === undefined
+        ? undefined
+        : { resumeNormalization: taskService.resumeNormalization.bind(taskService) },
+      usageRepository,
+      executionRepository,
     );
   const taskCleaner =
     dependencies.taskCleaner ??

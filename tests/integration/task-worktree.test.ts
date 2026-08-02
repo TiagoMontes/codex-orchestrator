@@ -38,9 +38,12 @@ describe("task worktrees", () => {
       now: () => new Date("2026-08-02T12:00:00.000Z"),
     });
     const taskService = new TaskService(
+      paths,
       taskRepository,
       projects,
       new DeterministicTaskNormalizer(),
+      undefined,
+      undefined,
       { now: () => new Date("2026-08-02T12:00:00.000Z") },
     );
     const created = await taskService.create({

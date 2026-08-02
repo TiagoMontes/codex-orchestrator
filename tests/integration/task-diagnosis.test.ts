@@ -7,7 +7,12 @@ import { ProjectService } from "../../src/application/projects/project-service.j
 import { TaskDiagnosisService } from "../../src/application/tasks/task-diagnosis-service.js";
 import { DeterministicTaskNormalizer } from "../../src/application/tasks/deterministic-task-normalizer.js";
 import { TaskService } from "../../src/application/tasks/task-service.js";
-import type { CodexRuntime } from "../../src/infrastructure/codex/codex-runtime.js";
+import type { TaskNormalizer } from "../../src/application/tasks/task-normalizer.js";
+import type {
+  CodexRunRequest,
+  CodexRunResult,
+  CodexRuntime,
+} from "../../src/infrastructure/codex/codex-runtime.js";
 import { DecisionFileRepository } from "../../src/infrastructure/persistence/decision-file-repository.js";
 import { DiagnosisFileRepository } from "../../src/infrastructure/persistence/diagnosis-file-repository.js";
 import { EvidenceFileRepository } from "../../src/infrastructure/persistence/evidence-file-repository.js";
@@ -40,9 +45,15 @@ describe("task diagnosis", () => {
     const taskRepository = new TaskFileRepository(paths, undefined, {
       now: () => new Date("2026-08-02T12:00:00.000Z"),
     });
-    const tasks = new TaskService(taskRepository, projects, new DeterministicTaskNormalizer(), {
-      now: () => new Date("2026-08-02T12:00:00.000Z"),
-    });
+    const tasks = new TaskService(
+      paths,
+      taskRepository,
+      projects,
+      new DeterministicTaskNormalizer(),
+      undefined,
+      undefined,
+      { now: () => new Date("2026-08-02T12:00:00.000Z") },
+    );
     const created = await tasks.create({
       project: "demo",
       feedback:
@@ -182,4 +193,204 @@ describe("task diagnosis", () => {
     });
     expect((await new UsageFileRepository(paths).read("demo", created.task.id)).totalCalls).toBe(1);
   });
+
+  it("runs explicitly requested independent read workers before the main diagnosis", async () => {
+    const fixture = await mkdtemp(join(tmpdir(), "cxo-parallel-diagnosis-fixture-"));
+    const stateHome = await mkdtemp(join(tmpdir(), "cxo-parallel-diagnosis-state-"));
+    temporaryDirectories.push(fixture, stateHome);
+    await createGitFixture(fixture);
+    const paths = new StatePaths({ CODEX_ORCHESTRATOR_HOME: stateHome });
+    const config = new ConfigService(paths);
+    await config.initialize();
+    const projects = new ProjectService(new ProjectFileRepository(paths));
+    await projects.add({ path: fixture, name: "demo" });
+    const taskRepository = new TaskFileRepository(paths);
+    const deterministic = new DeterministicTaskNormalizer();
+    const normalizer: TaskNormalizer = {
+      normalize: async (request) => {
+        const draft = await deterministic.normalize(request);
+        const first = draft.reports[0]!;
+        return {
+          ...draft,
+          reports: [
+            { ...first, id: "REPORT-001", title: "Inspect implementation module" },
+            {
+              ...first,
+              id: "REPORT-002",
+              title: "Inspect regression tests",
+              route: "/tests",
+            },
+          ],
+          suggestedScope: {
+            ...draft.suggestedScope,
+            estimatedFiles: ["index.js", "test/index.test.js"],
+          },
+        };
+      },
+    };
+    const created = await new TaskService(paths, taskRepository, projects, normalizer).create({
+      project: "demo",
+      feedback: "# Inspect two independent modules\n",
+      profile: "balanced",
+    });
+    const sourceCommit = await gitOutput(fixture, ["rev-parse", "HEAD"]);
+    let activeReaders = 0;
+    let maximumReaders = 0;
+    const roles: string[] = [];
+    let diagnosisPrompt = "";
+    const runtime: CodexRuntime = {
+      runStructured: async (request) => {
+        roles.push(request.role);
+        if (request.role === "read-worker") {
+          activeReaders += 1;
+          maximumReaders = Math.max(maximumReaders, activeReaders);
+          await new Promise<void>((resolve) => setTimeout(resolve, 20));
+          activeReaders -= 1;
+          const workerId = /^# Read-only workstream (.+)$/mu.exec(request.prompt)?.[1] ?? "missing";
+          const file = workerId === "report-1" ? "index.js" : "test/index.test.js";
+          const output = {
+            schemaVersion: 1,
+            workerId,
+            taskId: created.task.id,
+            sourceCommit,
+            summary: `Inspected ${file}`,
+            evidence: [
+              {
+                id: `untrusted-${workerId}`,
+                taskId: created.task.id,
+                kind: "file",
+                status: "confirmed",
+                statement: `${file} belongs to its independent workstream`,
+                sourceCommit,
+                file,
+                startLine: 1,
+                endLine: 1,
+                observedAt: "2026-08-02T12:01:00.000Z",
+              },
+            ],
+          };
+          return agentResult(request, output, `thread-${workerId}`);
+        }
+        diagnosisPrompt = request.prompt;
+        const output = {
+          diagnosis: {
+            schemaVersion: 1,
+            taskId: created.task.id,
+            sourceCommit,
+            status: "confirmed",
+            reproduction: {
+              attempted: false,
+              reproduced: false,
+              steps: [],
+              blockers: [],
+              evidenceIds: [],
+            },
+            confirmedFacts: [
+              { statement: "The implementation export is present", evidenceIds: ["D1"] },
+            ],
+            rootCauses: [
+              {
+                statement: "The task requires coordinated inspection only",
+                confidence: "medium",
+                evidenceIds: ["D1"],
+              },
+            ],
+            activeHypotheses: [],
+            rejectedHypotheses: [],
+            affectedFiles: [
+              { path: "index.js", reason: "Public implementation", symbols: ["publicValue"] },
+            ],
+            risks: [],
+            implementationPlan: [
+              { id: "P1", description: "Preserve both modules", files: ["index.js"], risk: "low" },
+            ],
+            verificationPlan: [
+              {
+                id: "V1",
+                name: "node tests",
+                argv: ["node", "--test"],
+                expectedOutcome: "tests pass",
+              },
+            ],
+            nextAction: "Prepare the implementation worktree",
+            createdAt: "2026-08-02T12:01:00.000Z",
+          },
+          evidence: [
+            {
+              id: "D1",
+              taskId: created.task.id,
+              kind: "file",
+              status: "confirmed",
+              statement: "index.js exports publicValue",
+              sourceCommit,
+              file: "index.js",
+              startLine: 1,
+              endLine: 1,
+              observedAt: "2026-08-02T12:01:00.000Z",
+            },
+          ],
+        };
+        return agentResult(request, output, "diagnosis-main-thread");
+      },
+    };
+    const usage = new UsageFileRepository(paths);
+    const executions = new ExecutionFileRepository(paths);
+    const diagnosis = new TaskDiagnosisService(
+      config,
+      paths,
+      taskRepository,
+      projects,
+      runtime,
+      usage,
+      new DiagnosisFileRepository(paths),
+      new EvidenceFileRepository(paths),
+      executions,
+      new DecisionFileRepository(paths),
+    );
+
+    const report = await diagnosis.diagnose(created.task.id, { parallelReaders: 2 });
+
+    expect(maximumReaders).toBe(2);
+    expect(roles.filter((role) => role === "read-worker")).toHaveLength(2);
+    expect(roles.at(-1)).toBe("diagnostician");
+    expect(diagnosisPrompt).toContain("PW-report-1");
+    expect(report.evidence).toHaveLength(3);
+    expect((await usage.read("demo", created.task.id)).totalCalls).toBe(3);
+    expect(
+      (await executions.list("demo", created.task.id)).filter(
+        (attempt) => attempt.phase === "exploration",
+      ),
+    ).toHaveLength(2);
+  });
 });
+
+function agentResult<T>(
+  request: CodexRunRequest<T>,
+  output: unknown,
+  threadId: string,
+): CodexRunResult<T> {
+  return {
+    threadId,
+    output: request.outputValidator.parse(output),
+    eventsPath: request.eventsPath,
+    usage: {
+      inputTokens: 100,
+      cachedInputTokens: 0,
+      cacheWriteInputTokens: 0,
+      outputTokens: 50,
+      reasoningOutputTokens: 10,
+      totalTokens: 150,
+      source: "actual" as const,
+    },
+    finalResponse: JSON.stringify(output),
+    runtimeAttempts: 1,
+    compatibility: {
+      sdkVersion: "0.146.0",
+      requestedReasoning: request.reasoningPreset,
+      mappedReasoning:
+        request.reasoningPreset === "deepest" ? ("xhigh" as const) : request.reasoningPreset,
+      fallbackApplied: false,
+      missingUsageFields: [],
+    },
+  };
+}

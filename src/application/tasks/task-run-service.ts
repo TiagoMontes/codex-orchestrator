@@ -10,6 +10,7 @@ import type {
 import type { ConfigService } from "../configuration/config-service.js";
 import type { ProjectManager } from "../projects/project-service.js";
 import type { Diagnosis } from "../../domain/diagnosis/diagnosis.js";
+import type { Evidence } from "../../domain/evidence/evidence.js";
 import type { DiffArtifact } from "../../domain/execution/diff-artifact.js";
 import type { ExecutionAttempt } from "../../domain/execution/execution-attempt.js";
 import { implementationResultSchema } from "../../domain/execution/implementation-result.js";
@@ -47,10 +48,13 @@ import { StopPolicy } from "../../orchestration/engine/stop-policy.js";
 import { TaskStateMachine } from "../../orchestration/engine/state-machine.js";
 import { EscalationPolicy } from "../../orchestration/routing/escalation-policy.js";
 import { ModelRouter, type RoutingOverrides } from "../../orchestration/routing/model-router.js";
+import { ParallelReadCoordinator } from "../../orchestration/parallel/parallel-read-coordinator.js";
+import { planParallelReads } from "../../orchestration/parallel/parallel-read-planner.js";
 import type { TaskWorktreeService } from "./task-worktree-service.js";
 import { VerificationService } from "./verification-service.js";
 import { SkillRegistry } from "../skills/skill-registry.js";
 import { PersistedTaskCancellation } from "./persisted-task-cancellation.js";
+import { executionFailureStatus, taskFailureStatus } from "./task-failure-policy.js";
 
 export type TaskRunOverrides = {
   profile?: ExecutionProfile;
@@ -220,6 +224,70 @@ export class TaskRunService implements TaskRunner {
           details: persistedOverrides,
         });
       }
+      const implementationScopes =
+        diagnosis.implementationPlan.length >= 2
+          ? diagnosis.implementationPlan.map((step) => ({
+              id: step.id,
+              objective: `Inspect implementation-plan step ${step.id}: ${step.description}`,
+              relevantFiles: step.files,
+            }))
+          : diagnosis.affectedFiles.map((file) => ({
+              id: file.path,
+              objective: `Inspect ${file.path}: ${file.reason}`,
+              relevantFiles: [file.path],
+            }));
+      const parallelPlan = planParallelReads({
+        task,
+        requestedReaders: overrides.parallelReaders ?? 0,
+        maximumReaders: Math.min(
+          config.parallelism.maxParallelReaders,
+          config.profiles[profile].maxParallelReaders,
+        ),
+        scopes: implementationScopes,
+      });
+      if (overrides.parallelReaders !== undefined) {
+        await this.decisions.append(project.id, task.id, {
+          kind: "human",
+          summary:
+            parallelPlan.mode === "parallel"
+              ? `Launching ${parallelPlan.workstreams.length} pre-write readers`
+              : `Parallel readers disabled: ${parallelPlan.reason}`,
+          details: {
+            phase: "implementation",
+            requestedReaders: overrides.parallelReaders,
+            selectedReaders: parallelPlan.mode === "parallel" ? parallelPlan.workstreams.length : 0,
+            reason: parallelPlan.reason,
+          },
+        });
+      }
+      if (parallelPlan.mode === "parallel") {
+        const parallel = await new ParallelReadCoordinator(
+          config,
+          this.paths,
+          this.runtime,
+          this.usage,
+          this.evidenceRepository,
+          this.executions,
+          this.decisions,
+          this.clock,
+        ).run({
+          task,
+          project,
+          sourceCommit: diagnosis.sourceCommit,
+          profile,
+          workstreams: parallelPlan.workstreams,
+          workingDirectory: worktree.path,
+          overrides: {
+            maxParallelReaders: parallelPlan.workstreams.length,
+            ...(overrides.model === undefined ? {} : { model: overrides.model }),
+            ...(overrides.reasoning === undefined ? {} : { reasoning: overrides.reasoning }),
+            ...(overrides.timeoutMs === undefined ? {} : { timeoutMs: overrides.timeoutMs }),
+            ...(overrides.abortSignal === undefined ? {} : { abortSignal: overrides.abortSignal }),
+          },
+        });
+        const consolidated = mergeEvidence([...evidence, ...parallel.result.evidence]);
+        evidence.splice(0, evidence.length, ...consolidated);
+      }
       let latestFailure: string | null = null;
       const interruptedReviewCorrection = allAttempts.some(
         (attempt) =>
@@ -383,7 +451,7 @@ export class TaskRunService implements TaskRunner {
           phase,
           profile,
           estimatedInputTokens: contextPack.estimatedInputTokens,
-          activeParallelReaders: overrides.parallelReaders ?? 0,
+          activeParallelReaders: 0,
           projectedAgentCalls: 2,
         });
         activeReservationId = admission.reservation.id;
@@ -604,7 +672,7 @@ export class TaskRunService implements TaskRunner {
             execution = {
               ...execution,
               completedAt: isoNow(this.clock),
-              status: normalized.code === "CANCELLED" ? "cancelled" : "blocked",
+              status: executionFailureStatus(normalized),
               error: {
                 name: normalized.name,
                 message: normalized.message,
@@ -647,7 +715,7 @@ export class TaskRunService implements TaskRunner {
         });
       }
       if (["implementing", "verifying", "ready-for-implementation"].includes(state.status)) {
-        const nextState = normalized.code === "CANCELLED" ? "cancelled" : "blocked";
+        const nextState = taskFailureStatus(normalized);
         ({ task, state } = await this.transition(task, state, nextState, normalized.message));
       }
       throw normalized;
@@ -780,4 +848,10 @@ function toJsonSchema(schema: z.ZodType): Record<string, unknown> {
     });
   }
   return converted;
+}
+
+function mergeEvidence(items: readonly Evidence[]): Evidence[] {
+  const byId = new Map<string, Evidence>();
+  for (const item of items) byId.set(item.id, item);
+  return [...byId.values()].sort((left, right) => left.id.localeCompare(right.id));
 }

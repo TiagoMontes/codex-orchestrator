@@ -7,6 +7,8 @@ import { projectSchema, type Project } from "../../domain/project/project.js";
 import type { Task } from "../../domain/task/task.js";
 import { GitClient } from "../../infrastructure/git/git-client.js";
 import type { ProjectFileRepository } from "../../infrastructure/persistence/project-file-repository.js";
+import { FileLockManager, type AcquiredLock } from "../../infrastructure/persistence/file-lock.js";
+import type { StatePaths } from "../../infrastructure/persistence/state-paths.js";
 import { StackDetector } from "./stack-detector.js";
 import { ProjectMetadataScanner } from "./project-metadata-scanner.js";
 
@@ -18,6 +20,8 @@ export interface ProjectManager {
 }
 
 export class ProjectService implements ProjectManager {
+  private readonly operationLocks: FileLockManager | undefined;
+
   constructor(
     private readonly repository: ProjectFileRepository,
     private readonly git = new GitClient(),
@@ -28,7 +32,11 @@ export class ProjectService implements ProjectManager {
       list(projectId?: string): Promise<Task[]>;
       removeProjectEntries(projectId: string): Promise<number>;
     },
-  ) {}
+    paths?: StatePaths,
+  ) {
+    this.operationLocks =
+      paths === undefined ? undefined : new FileLockManager(paths.locksDirectory);
+  }
 
   async add(input: { path: string; name?: string; baseRef?: string }): Promise<Project> {
     const gitMetadata = await this.git.inspectRepository(input.path);
@@ -86,33 +94,74 @@ export class ProjectService implements ProjectManager {
 
   async remove(reference: string): Promise<Project> {
     const project = await this.repository.get(reference);
-    const tasks = await this.tasks?.list(project.id);
-    const taskWithWorktree = tasks?.find((task) => task.worktree !== undefined);
-    if (taskWithWorktree !== undefined) {
-      throw new OrchestratorError(
-        `Project ${project.id} still owns task worktree ${taskWithWorktree.id}`,
-        { code: "PROJECT", nextCommand: `cxo task cleanup ${taskWithWorktree.id}` },
+    let projectLock: AcquiredLock | undefined;
+    const taskLocks: AcquiredLock[] = [];
+    try {
+      if (this.operationLocks !== undefined) {
+        try {
+          projectLock = await this.operationLocks.acquire(`project-operation:${project.id}`);
+        } catch (error) {
+          throw new OrchestratorError(`Project ${project.id} has an active intake operation`, {
+            code: "PROJECT",
+            resumable: true,
+            nextCommand: `cxo project inspect ${project.id}`,
+            cause: error,
+          });
+        }
+      }
+      let tasks = await this.tasks?.list(project.id);
+      for (const task of [...(tasks ?? [])].sort((left, right) =>
+        left.id.localeCompare(right.id),
+      )) {
+        if (this.operationLocks === undefined) break;
+        try {
+          taskLocks.push(await this.operationLocks.acquire(`task-operation:${task.id}`));
+        } catch (error) {
+          throw new OrchestratorError(
+            `Project ${project.id} task ${task.id} still has an active owner`,
+            {
+              code: "PROJECT",
+              resumable: true,
+              nextCommand: `cxo task status ${task.id}`,
+              cause: error,
+            },
+          );
+        }
+      }
+      tasks = await this.tasks?.list(project.id);
+      const active = tasks?.find((task) =>
+        [
+          "normalizing",
+          "diagnosing",
+          "worktree-preparing",
+          "implementing",
+          "verifying",
+          "reviewing",
+          "correcting",
+        ].includes(task.status),
       );
+      if (active !== undefined) {
+        throw new OrchestratorError(`Project ${project.id} still has active task ${active.id}`, {
+          code: "PROJECT",
+          nextCommand: `cxo task cancel ${active.id}`,
+        });
+      }
+      const taskWithWorktree = tasks?.find((task) => task.worktree !== undefined);
+      if (taskWithWorktree !== undefined) {
+        throw new OrchestratorError(
+          `Project ${project.id} still owns task worktree ${taskWithWorktree.id}`,
+          {
+            code: "PROJECT",
+            nextCommand: `cxo task cleanup ${taskWithWorktree.id} --remove-worktree`,
+          },
+        );
+      }
+      await this.tasks?.removeProjectEntries(project.id);
+      return await this.repository.remove(project.id);
+    } finally {
+      for (const lock of taskLocks.reverse()) await lock.release();
+      await projectLock?.release();
     }
-    const active = tasks?.find((task) =>
-      [
-        "normalizing",
-        "diagnosing",
-        "worktree-preparing",
-        "implementing",
-        "verifying",
-        "reviewing",
-        "correcting",
-      ].includes(task.status),
-    );
-    if (active !== undefined) {
-      throw new OrchestratorError(`Project ${project.id} still has active task ${active.id}`, {
-        code: "PROJECT",
-        nextCommand: `cxo task cancel ${active.id}`,
-      });
-    }
-    await this.tasks?.removeProjectEntries(project.id);
-    return this.repository.remove(project.id);
   }
 
   private async uniqueId(name: string, gitRoot: string): Promise<string> {

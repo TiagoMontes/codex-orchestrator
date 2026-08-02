@@ -91,6 +91,7 @@ export class ParallelReadCoordinator {
     sourceCommit: string;
     profile: ExecutionProfile;
     workstreams: ReadWorkstream[];
+    workingDirectory?: string;
     overrides?: ParallelReadOverrides;
   }): Promise<ParallelReadReport> {
     if (
@@ -124,12 +125,16 @@ export class ParallelReadCoordinator {
       });
     }
     assertIndependentWorkstreams(input.workstreams);
+    const workingDirectory =
+      input.workingDirectory === undefined
+        ? input.project.gitRoot
+        : await resolveSafePath(this.paths.worktreesDirectory, input.workingDirectory);
     const git = new GitClient({
       observer: async (record) => this.gitLog.append(input.project.id, input.task.id, record),
     });
     const before = {
-      head: await git.resolveCommit(input.project.gitRoot, "HEAD"),
-      status: await git.statusPorcelain(input.project.gitRoot),
+      head: await git.resolveCommit(workingDirectory, "HEAD"),
+      status: await git.statusPorcelain(workingDirectory),
     };
     if (before.head !== input.sourceCommit) {
       throw new OrchestratorError("Parallel read source commit is stale", {
@@ -175,8 +180,8 @@ export class ParallelReadCoordinator {
     }
     if (firstError !== undefined) throw toOrchestratorError(firstError);
     if (
-      (await git.resolveCommit(input.project.gitRoot, "HEAD")) !== before.head ||
-      (await git.statusPorcelain(input.project.gitRoot)) !== before.status
+      (await git.resolveCommit(workingDirectory, "HEAD")) !== before.head ||
+      (await git.statusPorcelain(workingDirectory)) !== before.status
     ) {
       throw new OrchestratorError("Repository changed during parallel read coordination", {
         code: "CONTEXT_INTEGRITY",
@@ -252,7 +257,8 @@ export class ParallelReadCoordinator {
     );
     const workerTokenCap = Math.floor(remaining / input.readerCount);
     const projected = pack.estimatedInputTokens + this.config.context.reservedOutputTokens;
-    if (projected > workerTokenCap) {
+    const worstCaseProjected = projected * 2;
+    if (worstCaseProjected > workerTokenCap) {
       throw new OrchestratorError(
         `Workstream ${input.workstream.id} exceeds its shared per-worker token cap`,
         { code: "BUDGET", resumable: true },
@@ -333,6 +339,7 @@ export class ParallelReadCoordinator {
       sourceCommit: string;
       profile: ExecutionProfile;
       workstreams: ReadWorkstream[];
+      workingDirectory?: string;
       overrides?: ParallelReadOverrides;
     },
     worker: PreparedWorker,
@@ -349,7 +356,7 @@ export class ParallelReadCoordinator {
       const runtimeResult = await this.runtime.runStructured({
         role: "read-worker",
         prompt,
-        workingDirectory: parent.project.gitRoot,
+        workingDirectory: parent.workingDirectory ?? parent.project.gitRoot,
         model: worker.modelDecision.model,
         reasoningPreset: worker.modelDecision.reasoning,
         sandboxMode: "read-only",
@@ -415,7 +422,12 @@ export class ParallelReadCoordinator {
       execution = {
         ...execution,
         completedAt: isoNow(this.clock),
-        status: normalized.code === "CANCELLED" ? "cancelled" : "blocked",
+        status:
+          normalized.code === "CANCELLED"
+            ? "cancelled"
+            : normalized.resumable
+              ? "blocked"
+              : "failed",
         error: {
           name: normalized.name,
           message: normalized.message,
@@ -431,7 +443,7 @@ export class ParallelReadCoordinator {
   private async validateEvidence(
     items: readonly Evidence[],
     workstream: ReadWorkstream,
-    parent: { task: Task; project: Project; sourceCommit: string },
+    parent: { task: Task; project: Project; sourceCommit: string; workingDirectory?: string },
   ): Promise<Evidence[]> {
     return Promise.all(
       items.map(async (item, index) => {
@@ -442,8 +454,9 @@ export class ParallelReadCoordinator {
         }
         const id = `PW-${workstream.id}-${index + 1}-${sha256(stableJson(item)).slice(0, 10)}`;
         if (item.file === undefined) return { ...item, id };
-        const path = await resolveSafePath(parent.project.gitRoot, item.file);
-        const relativePath = relative(parent.project.gitRoot, path).replaceAll("\\", "/");
+        const root = parent.workingDirectory ?? parent.project.gitRoot;
+        const path = await resolveSafePath(root, item.file);
+        const relativePath = relative(root, path).replaceAll("\\", "/");
         if (
           workstream.relevantFiles.length > 0 &&
           !workstream.relevantFiles.some((scope) => pathContains(scope, relativePath))

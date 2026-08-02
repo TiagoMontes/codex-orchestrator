@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -78,6 +79,10 @@ describe("task cancellation and resume", () => {
       seeded.projects,
       seeded.diagnosisRepository,
       verification,
+      undefined,
+      undefined,
+      usage,
+      executions,
     );
 
     const running = runner.run(seeded.task.id);
@@ -100,8 +105,39 @@ describe("task cancellation and resume", () => {
     expect(await gitOutput(repositoryRoot, ["rev-parse", "HEAD"])).toBe(primaryHead);
     expect(await gitOutput(repositoryRoot, ["status", "--porcelain=v1"])).toBe(primaryStatus);
 
+    await usage.reserve({
+      projectId: seeded.project.id,
+      taskId: seeded.task.id,
+      phase: "implementation",
+      projectedTokens: 100,
+      maxTotalTokens: 10_000,
+      maxAgentCalls: 10,
+    });
+    const priorAttempt = (await executions.list(seeded.project.id, seeded.task.id))[0];
+    expect(priorAttempt).toBeDefined();
+    if (priorAttempt !== undefined) {
+      const interrupted = structuredClone(priorAttempt);
+      delete interrupted.completedAt;
+      delete interrupted.error;
+      delete interrupted.threadId;
+      delete interrupted.resultArtifactPath;
+      await executions.save(seeded.project.id, {
+        ...interrupted,
+        id: randomUUID(),
+        startedAt: "2026-08-02T12:09:00.000Z",
+        status: "running",
+      });
+    }
+    expect((await usage.read(seeded.project.id, seeded.task.id)).reservations).toHaveLength(1);
+
     const resumed = await controller.resume(seeded.task.id);
     expect(resumed.state.status).toBe("ready-for-implementation");
     expect(resumed.nextCommand).toBe(`cxo task run ${seeded.task.id}`);
+    expect((await usage.read(seeded.project.id, seeded.task.id)).reservations).toEqual([]);
+    expect(
+      (await executions.list(seeded.project.id, seeded.task.id)).some(
+        (attempt) => attempt.status === "running",
+      ),
+    ).toBe(false);
   });
 });

@@ -189,13 +189,11 @@ export class TaskReportingService implements TaskReporter {
       });
     }
     const taskDirectory = this.paths.taskDirectory(task.projectId, task.id);
-    const patchPath = await resolveSafePath(taskDirectory, artifact.patchPath);
-    const patch = await readFile(patchPath, "utf8");
-    if (sha256(patch) !== artifact.diffHash) {
-      throw new OrchestratorError("Persisted diff patch hash is invalid", {
-        code: "CONTEXT_INTEGRITY",
-      });
-    }
+    const patch = await new DiffService(this.paths).readPersistedPatch(
+      artifact,
+      task.projectId,
+      task.id,
+    );
     const live = task.worktree !== undefined && (await exists(task.worktree.path));
     if (live && task.worktree !== undefined) {
       await new DiffService(this.paths).assertCurrent(artifact, task.worktree.path);

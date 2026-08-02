@@ -3,8 +3,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { ProjectService } from "../../src/application/projects/project-service.js";
+import { DeterministicTaskNormalizer } from "../../src/application/tasks/deterministic-task-normalizer.js";
+import { TaskService } from "../../src/application/tasks/task-service.js";
 import { ProjectFileRepository } from "../../src/infrastructure/persistence/project-file-repository.js";
+import { FileLockManager } from "../../src/infrastructure/persistence/file-lock.js";
 import { StatePaths } from "../../src/infrastructure/persistence/state-paths.js";
+import { TaskFileRepository } from "../../src/infrastructure/persistence/task-file-repository.js";
+import { TaskStateMachine } from "../../src/orchestration/engine/state-machine.js";
 import { createGitFixture, gitOutput } from "../helpers/git-fixture.js";
 
 const temporaryDirectories: string[] = [];
@@ -74,5 +79,65 @@ describe("project registration", () => {
       "fixture-project",
     );
     await expect(service.list()).resolves.toEqual([]);
+  });
+
+  it("refuses removal while a cancelled task phase still owns its operation lock", async () => {
+    const fixture = await mkdtemp(join(tmpdir(), "cxo-project-owned-fixture-"));
+    const stateHome = await mkdtemp(join(tmpdir(), "cxo-project-owned-state-"));
+    temporaryDirectories.push(fixture, stateHome);
+    await createGitFixture(fixture);
+    const paths = new StatePaths({ CODEX_ORCHESTRATOR_HOME: stateHome });
+    const tasks = new TaskFileRepository(paths);
+    const service = new ProjectService(
+      new ProjectFileRepository(paths),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      tasks,
+      paths,
+    );
+    const project = await service.add({ path: fixture, name: "demo" });
+    const created = await new TaskService(
+      paths,
+      tasks,
+      service,
+      new DeterministicTaskNormalizer(),
+    ).create({
+      project: project.id,
+      feedback: "# Cancelled intake fixture\n",
+      profile: "balanced",
+    });
+    const task = await tasks.get(created.task.id);
+    const state = await tasks.getState(task.id);
+    const timestamp = "2026-08-02T12:10:00.000Z";
+    const cancelled = new TaskStateMachine().transition(state, {
+      nextState: "cancelled",
+      timestamp,
+      reason: "fixture cancellation",
+      actor: "user",
+    });
+    await tasks.update(
+      { ...task, status: "cancelled", revision: task.revision + 1, updatedAt: timestamp },
+      cancelled,
+    );
+    const owned = await new FileLockManager(paths.locksDirectory).acquire(
+      `task-operation:${task.id}`,
+    );
+    try {
+      await expect(service.remove(project.id)).rejects.toMatchObject({
+        code: "PROJECT",
+        resumable: true,
+        nextCommand: `cxo task status ${task.id}`,
+      });
+    } finally {
+      await owned.release();
+    }
+
+    await expect(service.remove(project.id)).resolves.toMatchObject({ id: project.id });
+    await expect(tasks.list(project.id)).resolves.toEqual([]);
+    await expect(readFile(join(fixture, "package.json"), "utf8")).resolves.toContain(
+      "fixture-project",
+    );
   });
 });

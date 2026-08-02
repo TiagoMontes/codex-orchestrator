@@ -25,11 +25,19 @@ afterEach(async () => {
 });
 
 describe("project audit", () => {
-  it("persists five evidenced commit-scoped artifacts and marks them stale after evidence changes", async () => {
+  it("persists five evidenced commit-scoped artifacts and invalidates changed selected skills", async () => {
     const repositoryRoot = await mkdtemp(join(tmpdir(), "cxo-audit-fixture-"));
     const stateHome = await mkdtemp(join(tmpdir(), "cxo-audit-state-"));
     temporaryDirectories.push(repositoryRoot, stateHome);
     await createGitFixture(repositoryRoot);
+    const projectSkillPath = join(repositoryRoot, ".agents", "skills", "fixture-skill", "SKILL.md");
+    await writeFile(
+      projectSkillPath,
+      "---\nname: fixture-skill\ndescription: Inspect the fixture.\ntags: [audit]\n---\n\nRead only.\n",
+      "utf8",
+    );
+    await gitOutput(repositoryRoot, ["add", ".agents/skills/fixture-skill/SKILL.md"]);
+    await gitOutput(repositoryRoot, ["commit", "-m", "test: select audit skill"]);
     const paths = new StatePaths({ CODEX_ORCHESTRATOR_HOME: stateHome });
     const config = new ConfigService(paths);
     await config.initialize();
@@ -199,6 +207,27 @@ describe("project audit", () => {
     });
     expect(requests[0]?.resumeThreadId).toBeUndefined();
     expect(report.manifest).toMatchObject({ sourceCommit, stale: false });
+    expect(report.manifest.selectedSkills).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ name: "fixture-skill", source: "project" }),
+      ]),
+    );
+    const auditRun = JSON.parse(
+      await readFile(
+        join(
+          paths.knowledgeDirectory(project.id),
+          "audit-runs",
+          report.manifest.auditRunId,
+          "run.json",
+        ),
+        "utf8",
+      ),
+    ) as { selectedSkills: Array<{ name: string; source: string }> };
+    expect(
+      auditRun.selectedSkills.some(
+        (skill) => skill.name === "fixture-skill" && skill.source === "project",
+      ),
+    ).toBe(true);
     expect(report.artifacts.businessRules.payload.rules[0]).toMatchObject({ id: "BR-1" });
     expect(report.artifacts.repositoryMap.evidenceReferences[0]?.sha256).toMatch(/^[a-f0-9]{64}$/u);
     for (const filename of [
@@ -218,23 +247,31 @@ describe("project audit", () => {
       await gitOutput(repositoryRoot, ["status", "--porcelain=v1", "--untracked-files=all"]),
     ).toBe(beforeStatus);
 
-    await writeFile(join(repositoryRoot, "index.js"), "export const publicValue = 2;\n", "utf8");
-    await gitOutput(repositoryRoot, ["add", "index.js"]);
-    await gitOutput(repositoryRoot, ["commit", "-m", "fix: change audited evidence"]);
+    await writeFile(
+      projectSkillPath,
+      "---\nname: fixture-skill\ndescription: Inspect the fixture.\ntags: [audit]\n---\n\nRead only and report unknowns.\n",
+      "utf8",
+    );
+    await gitOutput(repositoryRoot, ["add", ".agents/skills/fixture-skill/SKILL.md"]);
+    await gitOutput(repositoryRoot, ["commit", "-m", "test: change selected audit skill"]);
     const nextCommit = await gitOutput(repositoryRoot, ["rev-parse", "HEAD"]);
     const refresh = await refresher.refresh(project.id);
 
     expect(refresh.project.registeredHeadCommit).toBe(sourceCommit);
     expect(refresh.project.currentHeadCommit).toBe(nextCommit);
-    expect(refresh.freshness).toMatchObject({ stale: true, usable: false });
+    expect(refresh.freshness).toMatchObject({
+      stale: true,
+      usable: false,
+      reason: "Selected workflow skills changed after the audit",
+    });
     expect(refresh.knowledge?.manifest.stale).toBe(true);
     expect(
       Object.values(refresh.knowledge?.artifacts ?? {}).every((artifact) => artifact.stale),
     ).toBe(true);
-    expect(
-      JSON.parse(
-        await readFile(join(paths.knowledgeDirectory(project.id), "manifest.json"), "utf8"),
-      ),
-    ).toMatchObject({ currentHeadCommit: nextCommit, stale: true });
+    const persistedManifest = JSON.parse(
+      await readFile(join(paths.knowledgeDirectory(project.id), "manifest.json"), "utf8"),
+    ) as { currentHeadCommit: string; stale: boolean; selectedSkills: Array<{ sha256: string }> };
+    expect(persistedManifest).toMatchObject({ currentHeadCommit: nextCommit, stale: true });
+    expect(persistedManifest.selectedSkills).toEqual(report.manifest.selectedSkills);
   });
 });

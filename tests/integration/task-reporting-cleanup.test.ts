@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { TaskCleanupService } from "../../src/application/tasks/task-cleanup-service.js";
 import { TaskReportingService } from "../../src/application/tasks/task-reporting-service.js";
 import { TaskWorktreeService } from "../../src/application/tasks/task-worktree-service.js";
+import { DiffService } from "../../src/infrastructure/git/diff-service.js";
 import { DecisionFileRepository } from "../../src/infrastructure/persistence/decision-file-repository.js";
 import { ExecutionFileRepository } from "../../src/infrastructure/persistence/execution-file-repository.js";
 import { ReviewFileRepository } from "../../src/infrastructure/persistence/review-file-repository.js";
@@ -109,6 +110,69 @@ describe("task reports and cleanup", () => {
       primaryStatus,
     );
   });
+
+  it("rejects completed cleanup when the persisted recovery patch was tampered", async () => {
+    const seeded = await createFixture("cleanup-tamper");
+    const state = await seeded.taskRepository.getState(seeded.task.id);
+    const timestamp = "2026-08-02T12:08:00.000Z";
+    const completedState = new TaskStateMachine().transition(state, {
+      nextState: "completed",
+      timestamp,
+      reason: "fixture review approved",
+      actor: "agent",
+    });
+    const task = await seeded.taskRepository.get(seeded.task.id);
+    await seeded.taskRepository.update(
+      { ...task, status: "completed", revision: task.revision + 1, updatedAt: timestamp },
+      completedState,
+    );
+    await writeFile(seeded.runReport.diff.patchPath, "tampered recovery patch\n", "utf8");
+    const cleaner = createCleaner(seeded);
+
+    await expect(cleaner.cleanup(seeded.task.id, { removeWorktree: true })).rejects.toMatchObject({
+      code: "CONTEXT_INTEGRITY",
+    });
+    await expect(access(task.worktree?.path ?? "")).resolves.toBeUndefined();
+    expect((await seeded.taskRepository.get(seeded.task.id)).worktree).toBeDefined();
+  });
+
+  it("captures a recovery patch and terminalizes explicit cancelled-task abandonment", async () => {
+    const seeded = await createFixture("cleanup-abandon");
+    const state = await seeded.taskRepository.getState(seeded.task.id);
+    const timestamp = "2026-08-02T12:08:00.000Z";
+    const cancelledState = new TaskStateMachine().transition(state, {
+      nextState: "cancelled",
+      timestamp,
+      reason: "fixture cancellation",
+      actor: "user",
+    });
+    const task = await seeded.taskRepository.get(seeded.task.id);
+    await seeded.taskRepository.update(
+      { ...task, status: "cancelled", revision: task.revision + 1, updatedAt: timestamp },
+      cancelledState,
+    );
+    const cleaner = createCleaner(seeded);
+    expect(await cleaner.cleanup(seeded.task.id)).toMatchObject({
+      dryRun: true,
+      abandonsTask: true,
+    });
+
+    const removed = await cleaner.cleanup(seeded.task.id, { removeWorktree: true });
+
+    expect(removed).toMatchObject({
+      removed: true,
+      abandonsTask: true,
+      reconciledExecutions: 0,
+    });
+    expect(removed.recoveryPatchPath).toBeDefined();
+    const persisted = await seeded.taskRepository.get(seeded.task.id);
+    expect(persisted.status).toBe("failed");
+    expect(persisted.worktree).toBeUndefined();
+    const diff = await new DiffService(seeded.paths).read(seeded.project.id, seeded.task.id);
+    await expect(
+      new DiffService(seeded.paths).readPersistedPatch(diff, seeded.project.id, seeded.task.id),
+    ).resolves.toContain("publicValue = 2");
+  });
 });
 
 async function createFixture(label: string) {
@@ -131,5 +195,19 @@ function createReporter(seeded: ImplementedFixture): TaskReportingService {
     new VerificationFileRepository(seeded.paths),
     new ReviewFileRepository(seeded.paths),
     new DecisionFileRepository(seeded.paths),
+  );
+}
+
+function createCleaner(seeded: ImplementedFixture): TaskCleanupService {
+  return new TaskCleanupService(
+    seeded.paths,
+    seeded.taskRepository,
+    new ExecutionFileRepository(seeded.paths),
+    new TaskWorktreeService(
+      seeded.paths,
+      seeded.taskRepository,
+      seeded.projects,
+      seeded.diagnosisRepository,
+    ),
   );
 }

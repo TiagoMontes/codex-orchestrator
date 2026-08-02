@@ -41,6 +41,9 @@ import { ModelRouter, type RoutingOverrides } from "../../orchestration/routing/
 import type { ExecutionAttempt } from "../../domain/execution/execution-attempt.js";
 import { SkillRegistry } from "../skills/skill-registry.js";
 import { PersistedTaskCancellation } from "./persisted-task-cancellation.js";
+import { executionFailureStatus, taskFailureStatus } from "./task-failure-policy.js";
+import { ParallelReadCoordinator } from "../../orchestration/parallel/parallel-read-coordinator.js";
+import { planParallelReads } from "../../orchestration/parallel/parallel-read-planner.js";
 
 export type DiagnosisOverrides = {
   profile?: ExecutionProfile;
@@ -118,7 +121,7 @@ export class TaskDiagnosisService implements TaskDiagnosisManager {
               cause: error,
             });
           } else if (persistedState.status === "diagnosing") {
-            await this.blockTask(persistedTask, persistedState, normalized.message);
+            await this.failTask(persistedTask, persistedState, normalized);
           }
         }
         throw normalized;
@@ -190,6 +193,63 @@ export class TaskDiagnosisService implements TaskDiagnosisManager {
 
     const executionId = randomUUID();
     const evidence: Evidence[] = [];
+    const parallelPlan = planParallelReads({
+      task,
+      requestedReaders: overrides.parallelReaders ?? 0,
+      maximumReaders: Math.min(
+        config.parallelism.maxParallelReaders,
+        config.profiles[profile].maxParallelReaders,
+      ),
+    });
+    if (overrides.parallelReaders !== undefined) {
+      await this.decisions.append(project.id, task.id, {
+        kind: "human",
+        summary:
+          parallelPlan.mode === "parallel"
+            ? `Launching ${parallelPlan.workstreams.length} bounded read-only workers`
+            : `Parallel readers disabled: ${parallelPlan.reason}`,
+        details: {
+          requestedReaders: overrides.parallelReaders,
+          selectedReaders: parallelPlan.mode === "parallel" ? parallelPlan.workstreams.length : 0,
+          reason: parallelPlan.reason,
+        },
+      });
+    }
+    if (parallelPlan.mode === "parallel") {
+      const parallelCancellation = new PersistedTaskCancellation(
+        this.tasks,
+        taskId,
+        overrides.abortSignal,
+      );
+      try {
+        const parallel = await new ParallelReadCoordinator(
+          config,
+          this.paths,
+          this.runtime,
+          this.usage,
+          this.evidenceRepository,
+          this.executions,
+          this.decisions,
+          this.clock,
+        ).run({
+          task,
+          project,
+          sourceCommit,
+          profile,
+          workstreams: parallelPlan.workstreams,
+          overrides: {
+            maxParallelReaders: parallelPlan.workstreams.length,
+            ...(overrides.model === undefined ? {} : { model: overrides.model }),
+            ...(overrides.reasoning === undefined ? {} : { reasoning: overrides.reasoning }),
+            ...(overrides.timeoutMs === undefined ? {} : { timeoutMs: overrides.timeoutMs }),
+            abortSignal: parallelCancellation.signal,
+          },
+        });
+        evidence.push(...parallel.result.evidence);
+      } finally {
+        parallelCancellation.dispose(overrides.abortSignal);
+      }
+    }
     const selectedSkills = await this.skillRegistry.select({
       phase: "diagnosis",
       task,
@@ -231,7 +291,7 @@ export class TaskDiagnosisService implements TaskDiagnosisManager {
       phase: "diagnosis",
       profile,
       estimatedInputTokens: pack.estimatedInputTokens,
-      activeParallelReaders: overrides.parallelReaders ?? 0,
+      activeParallelReaders: 0,
       projectedAgentCalls: 2,
     });
     await this.decisions.append(project.id, task.id, {
@@ -308,12 +368,13 @@ export class TaskDiagnosisService implements TaskDiagnosisManager {
           code: "CONTEXT_INTEGRITY",
         });
       }
-      const validatedEvidence = await this.validateEvidence(
+      const diagnosisEvidence = await this.validateEvidence(
         result.evidence,
         task,
         project.gitRoot,
         sourceCommit,
       );
+      const validatedEvidence = deduplicateEvidence([...evidence, ...diagnosisEvidence]);
       assertEvidenceReferences(result.diagnosis, validatedEvidence);
       const diagnosis = diagnosisSchema.parse(result.diagnosis);
       const diagnosisPath = await this.diagnoses.save(project.id, diagnosis);
@@ -377,7 +438,7 @@ export class TaskDiagnosisService implements TaskDiagnosisManager {
       attempt = {
         ...attempt,
         completedAt: failedAt,
-        status: normalized.code === "CANCELLED" ? "cancelled" : "blocked",
+        status: executionFailureStatus(normalized),
         error: {
           name: normalized.name,
           message: normalized.message,
@@ -387,7 +448,7 @@ export class TaskDiagnosisService implements TaskDiagnosisManager {
       };
       await this.executions.save(project.id, attempt);
       if (persistedState.status !== "cancelled") {
-        const nextState = normalized.code === "CANCELLED" ? "cancelled" : "blocked";
+        const nextState = taskFailureStatus(normalized);
         state = this.stateMachine.transition(persistedState, {
           nextState,
           timestamp: failedAt,
@@ -463,6 +524,25 @@ export class TaskDiagnosisService implements TaskDiagnosisManager {
     );
   }
 
+  private async failTask(
+    task: Task,
+    state: TaskStateDocument,
+    error: OrchestratorError,
+  ): Promise<void> {
+    const timestamp = isoNow(this.clock);
+    const status = taskFailureStatus(error);
+    const failed = this.stateMachine.transition(state, {
+      nextState: status,
+      timestamp,
+      reason: error.message,
+      actor: "system",
+    });
+    await this.tasks.update(
+      { ...task, status, revision: task.revision + 1, updatedAt: timestamp },
+      failed,
+    );
+  }
+
   private contextPackPath(task: Task, executionId: string): string {
     return `${this.paths.taskDirectory(task.projectId, task.id)}/context-packs/diagnosis-${executionId}.json`;
   }
@@ -519,4 +599,10 @@ function assertEvidenceReferences(diagnosis: Diagnosis, evidence: readonly Evide
       code: "CONTEXT_INTEGRITY",
     });
   }
+}
+
+function deduplicateEvidence(items: readonly Evidence[]): Evidence[] {
+  const byId = new Map<string, Evidence>();
+  for (const item of items) byId.set(item.id, item);
+  return [...byId.values()].sort((left, right) => left.id.localeCompare(right.id));
 }

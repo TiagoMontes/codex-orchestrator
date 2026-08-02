@@ -13,18 +13,36 @@ export class KnowledgeFreshnessService {
     generation: KnowledgeGeneration;
     currentHeadCommit: string;
     instructionHashes: Array<{ path: string; sha256: string }>;
+    selectedSkills: Array<{
+      name: string;
+      source: "bundled" | "project" | "user";
+      sha256: string;
+      instructionsSha256: string;
+    }>;
     changedFiles: readonly string[];
   }): KnowledgeFreshnessAssessment {
     const instructionsChanged =
       JSON.stringify(normalizeHashes(input.generation.manifest.instructionHashes)) !==
       JSON.stringify(normalizeHashes(input.instructionHashes));
     const headChanged = input.generation.manifest.sourceCommit !== input.currentHeadCommit;
-    if (!instructionsChanged && !headChanged) return { stale: false, usable: true };
+    const skillsChanged =
+      JSON.stringify(normalizeSkills(input.generation.manifest.selectedSkills)) !==
+      JSON.stringify(normalizeSkills(input.selectedSkills));
+    if (!instructionsChanged && !skillsChanged && !headChanged) {
+      return { stale: false, usable: true };
+    }
     if (instructionsChanged) {
       return {
         stale: true,
         usable: false,
         reason: "Repository instruction files changed after the audit",
+      };
+    }
+    if (skillsChanged) {
+      return {
+        stale: true,
+        usable: false,
+        reason: "Selected workflow skills changed after the audit",
       };
     }
     const evidenceFiles = new Set(
@@ -66,4 +84,17 @@ export class KnowledgeFreshnessService {
 
 function normalizeHashes(items: Array<{ path: string; sha256: string }>) {
   return [...items].sort((left, right) => left.path.localeCompare(right.path));
+}
+
+function normalizeSkills(
+  items: Array<{
+    name: string;
+    source: "bundled" | "project" | "user";
+    sha256: string;
+    instructionsSha256: string;
+  }>,
+) {
+  return [...items].sort((left, right) =>
+    `${left.source}:${left.name}`.localeCompare(`${right.source}:${right.name}`),
+  );
 }

@@ -97,8 +97,13 @@ export class CommandRunner {
     child.stderr.on("data", (chunk: Buffer) => log.push("stderr", chunk));
 
     const terminate = (reason: "timeout" | "abort"): void => {
-      if (reason === "timeout") timedOut = true;
-      else aborted = true;
+      if (reason === "timeout") {
+        if (timedOut) return;
+        timedOut = true;
+      } else {
+        if (aborted) return;
+        aborted = true;
+      }
       if (!child.killed) child.kill("SIGTERM");
       forceKillTimer = setTimeout(() => {
         if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
@@ -109,6 +114,7 @@ export class CommandRunner {
     timeout.unref();
     const abortListener = (): void => terminate("abort");
     request.abortSignal?.addEventListener("abort", abortListener, { once: true });
+    if (request.abortSignal?.aborted ?? false) abortListener();
 
     const outcome = await new Promise<{
       exitCode: number | null;

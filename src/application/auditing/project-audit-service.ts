@@ -114,8 +114,9 @@ export class ProjectAuditService implements ProjectAuditor {
     }
     const profile = overrides.profile ?? config.defaultProfile;
     const limits = effectiveLimits(config, profile, overrides);
-    const projectedTokens = estimatedInputTokens + config.context.reservedOutputTokens;
-    if (projectedTokens > limits.maxTotalTokens || limits.maxAgentCalls < 2) {
+    const estimatedCallTokens = estimatedInputTokens + config.context.reservedOutputTokens;
+    const worstCaseRuntimeTokens = estimatedCallTokens * 2;
+    if (worstCaseRuntimeTokens > limits.maxTotalTokens || limits.maxAgentCalls < 2) {
       throw new OrchestratorError("Audit call cannot be admitted by the selected budget", {
         code: "BUDGET",
         resumable: true,
@@ -124,7 +125,7 @@ export class ProjectAuditService implements ProjectAuditor {
     const decision = new ModelRouter(config).route({
       phase: "audit",
       profile,
-      estimatedCallTokens: projectedTokens,
+      estimatedCallTokens,
       remainingBudgetTokens: limits.maxTotalTokens,
       overrides: {
         ...(overrides.model === undefined ? {} : { model: overrides.model }),
@@ -225,6 +226,12 @@ export class ProjectAuditService implements ProjectAuditor {
         path: item.relativePath,
         sha256: item.sha256,
       })),
+      selectedSkills: selectedSkills.map(({ name, source, sha256, instructionsSha256 }) => ({
+        name,
+        source,
+        sha256,
+        instructionsSha256,
+      })),
       artifactHashes: artifactHashes(artifacts),
       stale: false,
       updatedAt: generatedAt,
@@ -241,6 +248,12 @@ export class ProjectAuditService implements ProjectAuditor {
         modelDecision: decision,
         usage: runtimeResult.usage,
         runtimeAttempts: runtimeResult.runtimeAttempts,
+        selectedSkills: selectedSkills.map(({ name, source, sha256, instructionsSha256 }) => ({
+          name,
+          source,
+          sha256,
+          instructionsSha256,
+        })),
         overrides: {
           ...(overrides.profile === undefined ? {} : { profile: overrides.profile }),
           ...(overrides.model === undefined ? {} : { model: overrides.model }),

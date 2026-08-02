@@ -51,9 +51,12 @@ import { ContextIntegrityValidator } from "../../orchestration/context/context-i
 import { ContextPackBuilder } from "../../orchestration/context/context-pack-builder.js";
 import { TaskStateMachine } from "../../orchestration/engine/state-machine.js";
 import { ModelRouter, type RoutingOverrides } from "../../orchestration/routing/model-router.js";
+import { ParallelReadCoordinator } from "../../orchestration/parallel/parallel-read-coordinator.js";
+import { planParallelReads } from "../../orchestration/parallel/parallel-read-planner.js";
 import { VerificationService } from "./verification-service.js";
 import { SkillRegistry } from "../skills/skill-registry.js";
 import { PersistedTaskCancellation } from "./persisted-task-cancellation.js";
+import { executionFailureStatus, taskFailureStatus } from "./task-failure-policy.js";
 
 export type TaskReviewOverrides = {
   profile?: ExecutionProfile;
@@ -190,12 +193,7 @@ export class TaskReviewService implements TaskReviewer {
       let diff = await diffService.read(project.id, task.id);
       let verification = await this.verificationRepository.read(project.id, task.id);
       await assertReviewArtifacts(diffService, diff, verification, worktree.path, diagnosis);
-      let patch = await readFile(diff.patchPath, "utf8");
-      if (sha256(patch) !== diff.diffHash) {
-        throw new OrchestratorError("Persisted review patch hash is invalid", {
-          code: "CONTEXT_INTEGRITY",
-        });
-      }
+      let patch = await diffService.readPersistedPatch(diff, project.id, task.id);
       const evidence = await this.evidenceRepository.read(project.id, task.id);
       const reviewResults: ReviewResult[] = [];
       const corrections: ExecutionAttempt[] = [];
@@ -217,6 +215,62 @@ export class TaskReviewService implements TaskReviewer {
           summary: "Execution overrides applied to independent review",
           details: persistedOverrides,
         });
+      }
+      const parallelPlan = planParallelReads({
+        task,
+        requestedReaders: overrides.parallelReaders ?? 0,
+        maximumReaders: Math.min(
+          config.parallelism.maxParallelReaders,
+          config.profiles[profile].maxParallelReaders,
+        ),
+        scopes: diff.changedFiles.map((file) => ({
+          id: file,
+          objective: `Independently inspect the changed file ${file} for review evidence`,
+          relevantFiles: [file],
+        })),
+      });
+      if (overrides.parallelReaders !== undefined) {
+        await this.decisions.append(project.id, task.id, {
+          kind: "human",
+          summary:
+            parallelPlan.mode === "parallel"
+              ? `Launching ${parallelPlan.workstreams.length} independent review readers`
+              : `Parallel readers disabled: ${parallelPlan.reason}`,
+          details: {
+            phase: "review",
+            requestedReaders: overrides.parallelReaders,
+            selectedReaders: parallelPlan.mode === "parallel" ? parallelPlan.workstreams.length : 0,
+            reason: parallelPlan.reason,
+          },
+        });
+      }
+      if (parallelPlan.mode === "parallel") {
+        const parallel = await new ParallelReadCoordinator(
+          config,
+          this.paths,
+          this.runtime,
+          this.usage,
+          this.evidenceRepository,
+          this.executions,
+          this.decisions,
+          this.clock,
+        ).run({
+          task,
+          project,
+          sourceCommit: diagnosis.sourceCommit,
+          profile,
+          workstreams: parallelPlan.workstreams,
+          workingDirectory: worktree.path,
+          overrides: {
+            maxParallelReaders: parallelPlan.workstreams.length,
+            ...(overrides.model === undefined ? {} : { model: overrides.model }),
+            ...(overrides.reasoning === undefined ? {} : { reasoning: overrides.reasoning }),
+            ...(overrides.timeoutMs === undefined ? {} : { timeoutMs: overrides.timeoutMs }),
+            ...(overrides.abortSignal === undefined ? {} : { abortSignal: overrides.abortSignal }),
+          },
+        });
+        const consolidated = mergeEvidence([...evidence, ...parallel.result.evidence]);
+        evidence.splice(0, evidence.length, ...consolidated);
       }
 
       for (let cycle = priorReviewCycles + 1; cycle <= maximumCycles; cycle += 1) {
@@ -255,7 +309,7 @@ export class TaskReviewService implements TaskReviewer {
             ...reviewer.execution,
             threadId: reviewer.threadId,
             completedAt: isoNow(this.clock),
-            status: "blocked",
+            status: executionFailureStatus(normalized),
             usage: reviewer.usage,
             error: {
               name: normalized.name,
@@ -334,74 +388,106 @@ export class TaskReviewService implements TaskReviewer {
           overrides,
           diffService,
         });
-        if (correction.diff.diffHash === diff.diffHash) {
-          await this.executions.save(project.id, {
+        let correctionFinalized = false;
+        try {
+          if (correction.diff.diffHash === diff.diffHash) {
+            await this.executions.save(project.id, {
+              ...correction.execution,
+              completedAt: isoNow(this.clock),
+              status: "blocked",
+              threadId: correction.threadId,
+              usage: correction.usage,
+              resultArtifactPath: correction.resultArtifactPath,
+              error: {
+                name: "OrchestratorError",
+                message: "review_correction_produced_no_new_diff",
+                code: "REVIEW_CHANGES",
+                resumable: true,
+              },
+            });
+            correctionFinalized = true;
+            await this.stopTask(task, state, "review_correction_produced_no_new_diff");
+          }
+          ({ task, state } = await this.transition(
+            task,
+            state,
+            "verifying",
+            `Review correction produced diff ${correction.diff.diffHash}`,
+            correction.execution.id,
+          ));
+          const verificationService = new VerificationService(
+            config,
+            this.paths,
+            this.evidenceRepository,
+            this.verificationRepository,
+            diffService,
+            this.clock,
+          );
+          const verificationReport = await verificationService.verify({
+            task,
+            project,
+            worktreePath: worktree.path,
+            diff: correction.diff,
+            executionId: correction.execution.id,
+            ...(overrides.abortSignal === undefined ? {} : { abortSignal: overrides.abortSignal }),
+          });
+          for (const item of verificationReport.evidence) {
+            if (!evidence.some((existing) => existing.id === item.id)) evidence.push(item);
+          }
+          const correctionExecution: ExecutionAttempt = {
             ...correction.execution,
             completedAt: isoNow(this.clock),
-            status: "blocked",
+            status: verificationReport.result.overallStatus === "passed" ? "succeeded" : "failed",
             threadId: correction.threadId,
             usage: correction.usage,
-            error: {
-              name: "OrchestratorError",
-              message: "review_correction_produced_no_new_diff",
-              code: "REVIEW_CHANGES",
-              resumable: true,
-            },
-          });
-          await this.stopTask(task, state, "review_correction_produced_no_new_diff");
+            resultArtifactPath: correction.resultArtifactPath,
+            ...(verificationReport.failureSignature === undefined
+              ? {}
+              : { failureSignature: verificationReport.failureSignature }),
+          };
+          await this.executions.save(project.id, correctionExecution);
+          correctionFinalized = true;
+          corrections.push(correctionExecution);
+          if (verificationReport.result.overallStatus !== "passed") {
+            await this.stopTask(task, state, "review_correction_verification_failed");
+          }
+          diff = correction.diff;
+          verification = verificationReport.result;
+          patch = await diffService.readPersistedPatch(diff, project.id, task.id);
+          ({ task, state } = await this.transition(
+            task,
+            state,
+            "reviewing",
+            `Fresh review required for corrected diff ${diff.diffHash}`,
+            correction.execution.id,
+          ));
+        } catch (error) {
+          if (!correctionFinalized) {
+            let normalized = toOrchestratorError(error);
+            if (overrides.abortSignal?.aborted ?? false) {
+              normalized = new OrchestratorError("Task review correction was cancelled", {
+                code: "CANCELLED",
+                resumable: true,
+                cause: error,
+              });
+            }
+            await this.executions.save(project.id, {
+              ...correction.execution,
+              completedAt: isoNow(this.clock),
+              status: executionFailureStatus(normalized),
+              threadId: correction.threadId,
+              usage: correction.usage,
+              resultArtifactPath: correction.resultArtifactPath,
+              error: {
+                name: normalized.name,
+                message: normalized.message,
+                code: normalized.code,
+                resumable: normalized.resumable,
+              },
+            });
+          }
+          throw error;
         }
-        ({ task, state } = await this.transition(
-          task,
-          state,
-          "verifying",
-          `Review correction produced diff ${correction.diff.diffHash}`,
-          correction.execution.id,
-        ));
-        const verificationService = new VerificationService(
-          config,
-          this.paths,
-          this.evidenceRepository,
-          this.verificationRepository,
-          diffService,
-          this.clock,
-        );
-        const verificationReport = await verificationService.verify({
-          task,
-          project,
-          worktreePath: worktree.path,
-          diff: correction.diff,
-          executionId: correction.execution.id,
-          ...(overrides.abortSignal === undefined ? {} : { abortSignal: overrides.abortSignal }),
-        });
-        for (const item of verificationReport.evidence) {
-          if (!evidence.some((existing) => existing.id === item.id)) evidence.push(item);
-        }
-        const correctionExecution: ExecutionAttempt = {
-          ...correction.execution,
-          completedAt: isoNow(this.clock),
-          status: verificationReport.result.overallStatus === "passed" ? "succeeded" : "failed",
-          threadId: correction.threadId,
-          usage: correction.usage,
-          resultArtifactPath: correction.resultArtifactPath,
-          ...(verificationReport.failureSignature === undefined
-            ? {}
-            : { failureSignature: verificationReport.failureSignature }),
-        };
-        await this.executions.save(project.id, correctionExecution);
-        corrections.push(correctionExecution);
-        if (verificationReport.result.overallStatus !== "passed") {
-          await this.stopTask(task, state, "review_correction_verification_failed");
-        }
-        diff = correction.diff;
-        verification = verificationReport.result;
-        patch = await readFile(diff.patchPath, "utf8");
-        ({ task, state } = await this.transition(
-          task,
-          state,
-          "reviewing",
-          `Fresh review required for corrected diff ${diff.diffHash}`,
-          correction.execution.id,
-        ));
       }
       return this.stopTask(task, state, "review_cycle_limit_reached");
     } catch (error) {
@@ -419,7 +505,7 @@ export class TaskReviewService implements TaskReviewer {
         ({ task, state } = await this.transition(
           task,
           state,
-          normalized.code === "CANCELLED" ? "cancelled" : "blocked",
+          taskFailureStatus(normalized),
           normalized.message,
         ));
       }
@@ -575,7 +661,7 @@ export class TaskReviewService implements TaskReviewer {
       execution = {
         ...execution,
         completedAt: isoNow(this.clock),
-        status: normalized.code === "CANCELLED" ? "cancelled" : "blocked",
+        status: executionFailureStatus(normalized),
         error: {
           name: normalized.name,
           message: normalized.message,
@@ -765,7 +851,7 @@ export class TaskReviewService implements TaskReviewer {
       execution = {
         ...execution,
         completedAt: isoNow(this.clock),
-        status: normalized.code === "CANCELLED" ? "cancelled" : "blocked",
+        status: executionFailureStatus(normalized),
         error: {
           name: normalized.name,
           message: normalized.message,
@@ -808,7 +894,7 @@ export class TaskReviewService implements TaskReviewer {
       phase: input.phase,
       profile: input.profile,
       estimatedInputTokens: input.estimatedInputTokens,
-      activeParallelReaders: input.overrides.parallelReaders ?? 0,
+      activeParallelReaders: 0,
       projectedAgentCalls: 2,
     });
     await this.decisions.append(input.project.id, input.task.id, {
@@ -1104,4 +1190,10 @@ function toJsonSchema(schema: z.ZodType): Record<string, unknown> {
     });
   }
   return converted;
+}
+
+function mergeEvidence(items: readonly Evidence[]): Evidence[] {
+  const byId = new Map<string, Evidence>();
+  for (const item of items) byId.set(item.id, item);
+  return [...byId.values()].sort((left, right) => left.id.localeCompare(right.id));
 }

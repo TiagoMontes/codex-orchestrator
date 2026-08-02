@@ -1,3 +1,4 @@
+import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { DiffArtifact } from "../../domain/execution/diff-artifact.js";
 import { diffArtifactSchema } from "../../domain/execution/diff-artifact.js";
@@ -80,5 +81,26 @@ export class DiffService {
         resumable: true,
       });
     }
+  }
+
+  async readPersistedPatch(
+    artifact: DiffArtifact,
+    projectId: string,
+    taskId: string,
+  ): Promise<string> {
+    if (artifact.taskId !== taskId) {
+      throw new OrchestratorError("Persisted diff identity mismatch", {
+        code: "CONTEXT_INTEGRITY",
+      });
+    }
+    const taskDirectory = this.paths.taskDirectory(projectId, taskId);
+    const patchPath = await resolveSafePath(taskDirectory, artifact.patchPath);
+    const patch = await readFile(patchPath, "utf8");
+    if (sha256(patch) !== artifact.diffHash) {
+      throw new OrchestratorError("Persisted diff patch hash is invalid", {
+        code: "CONTEXT_INTEGRITY",
+      });
+    }
+    return patch;
   }
 }

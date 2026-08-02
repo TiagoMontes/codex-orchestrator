@@ -147,6 +147,20 @@ export class UsageFileRepository {
     }
   }
 
+  async releaseAllReservations(projectId: string, taskId: string): Promise<number> {
+    const lock = await this.locks.acquire(`usage:${taskId}`);
+    try {
+      const ledger = await this.readOrCreate(projectId, taskId);
+      const released = ledger.reservations.length;
+      ledger.reservations = [];
+      ledger.updatedAt = isoNow(this.clock);
+      await this.write(projectId, taskId, ledger);
+      return released;
+    } finally {
+      await lock.release();
+    }
+  }
+
   read(projectId: string, taskId: string): Promise<UsageLedgerDocument> {
     return this.readOrCreate(projectId, taskId);
   }
