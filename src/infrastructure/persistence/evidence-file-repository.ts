@@ -1,3 +1,4 @@
+import { access, constants } from "node:fs/promises";
 import { join } from "node:path";
 import { z } from "zod";
 import type { StatePaths } from "./state-paths.js";
@@ -34,6 +35,28 @@ export class EvidenceFileRepository {
 
   async read(projectId: string, taskId: string): Promise<Evidence[]> {
     const path = join(this.paths.taskDirectory(projectId, taskId), "evidence.json");
+    if (!(await exists(path))) return [];
     return (await this.store.read(path, evidenceDocumentSchema)).items;
+  }
+
+  async merge(projectId: string, taskId: string, items: readonly Evidence[]): Promise<string> {
+    const path = join(this.paths.taskDirectory(projectId, taskId), "evidence.json");
+    const existing = (await exists(path)) ? await this.read(projectId, taskId) : [];
+    const byId = new Map(existing.map((item) => [item.id, item]));
+    for (const item of items) byId.set(item.id, item);
+    return this.save(
+      projectId,
+      taskId,
+      [...byId.values()].sort((left, right) => left.id.localeCompare(right.id)),
+    );
+  }
+}
+
+async function exists(path: string): Promise<boolean> {
+  try {
+    await access(path, constants.F_OK);
+    return true;
+  } catch {
+    return false;
   }
 }

@@ -28,6 +28,11 @@ import { EvidenceFileRepository } from "../infrastructure/persistence/evidence-f
 import { ExecutionFileRepository } from "../infrastructure/persistence/execution-file-repository.js";
 import { DecisionFileRepository } from "../infrastructure/persistence/decision-file-repository.js";
 import { registerTaskDiagnoseCommand } from "./commands/task-diagnose.command.js";
+import type { TaskRunner } from "../application/tasks/task-run-service.js";
+import { TaskRunService } from "../application/tasks/task-run-service.js";
+import { TaskWorktreeService } from "../application/tasks/task-worktree-service.js";
+import { VerificationFileRepository } from "../infrastructure/persistence/verification-file-repository.js";
+import { registerTaskRunCommand } from "./commands/task-run.command.js";
 
 export type ProgramDependencies = {
   output?: OutputWriter;
@@ -36,6 +41,7 @@ export type ProgramDependencies = {
   projectService?: ProjectManager;
   taskService?: TaskManager;
   taskDiagnosisService?: TaskDiagnosisManager;
+  taskRunService?: TaskRunner;
   codexRuntime?: CodexRuntime;
 };
 
@@ -51,6 +57,12 @@ export function createProgram(dependencies: ProgramDependencies = {}): Command {
     dependencies.taskService ??
     new TaskService(taskRepository, projectService, new DeterministicTaskNormalizer());
   const codexRuntime = dependencies.codexRuntime ?? new CodexSdkRuntime();
+  const usageRepository = new UsageFileRepository(configService.paths);
+  const diagnosisRepository = new DiagnosisFileRepository(configService.paths);
+  const evidenceRepository = new EvidenceFileRepository(configService.paths);
+  const executionRepository = new ExecutionFileRepository(configService.paths);
+  const decisionRepository = new DecisionFileRepository(configService.paths);
+  const verificationRepository = new VerificationFileRepository(configService.paths);
   const taskDiagnosisService =
     dependencies.taskDiagnosisService ??
     new TaskDiagnosisService(
@@ -59,11 +71,33 @@ export function createProgram(dependencies: ProgramDependencies = {}): Command {
       taskRepository,
       projectService,
       codexRuntime,
-      new UsageFileRepository(configService.paths),
-      new DiagnosisFileRepository(configService.paths),
-      new EvidenceFileRepository(configService.paths),
-      new ExecutionFileRepository(configService.paths),
-      new DecisionFileRepository(configService.paths),
+      usageRepository,
+      diagnosisRepository,
+      evidenceRepository,
+      executionRepository,
+      decisionRepository,
+    );
+  const taskWorktreeService = new TaskWorktreeService(
+    configService.paths,
+    taskRepository,
+    projectService,
+    diagnosisRepository,
+  );
+  const taskRunService =
+    dependencies.taskRunService ??
+    new TaskRunService(
+      configService,
+      configService.paths,
+      taskRepository,
+      projectService,
+      taskWorktreeService,
+      codexRuntime,
+      usageRepository,
+      diagnosisRepository,
+      evidenceRepository,
+      executionRepository,
+      decisionRepository,
+      verificationRepository,
     );
   const program = new Command();
 
@@ -92,6 +126,7 @@ export function createProgram(dependencies: ProgramDependencies = {}): Command {
   registerTaskCreateCommand(task, program, taskService, configService, output);
   registerTaskQueryCommands(task, program, taskService, configService, output);
   registerTaskDiagnoseCommand(task, program, taskDiagnosisService, output);
+  registerTaskRunCommand(task, program, taskRunService, output);
 
   return program;
 }
