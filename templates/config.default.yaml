@@ -1,0 +1,107 @@
+schemaVersion: 1
+defaultProfile: balanced
+
+models:
+  aliases:
+    capable: gpt-5.6
+    efficient: gpt-5.6-terra
+    fast: gpt-5.6-luna
+  reasoningFallback:
+    deepest: [xhigh, high]
+    high: [high, medium]
+    medium: [medium, low]
+    low: [low, minimal]
+    minimal: [minimal]
+
+routing:
+  normalization: { modelAlias: fast, reasoning: low }
+  cheapClassification: { modelAlias: fast, reasoning: low }
+  repositoryExploration: { modelAlias: efficient, reasoning: medium }
+  standardDiagnosis: { modelAlias: efficient, reasoning: medium }
+  complexDiagnosis: { modelAlias: capable, reasoning: high }
+  standardImplementation: { modelAlias: efficient, reasoning: medium }
+  complexImplementation: { modelAlias: capable, reasoning: high }
+  independentReview: { modelAlias: capable, reasoning: high }
+  criticalReview: { modelAlias: capable, reasoning: deepest }
+
+profiles:
+  economy:
+    maxTotalTokens: 50000
+    maxAgentCalls: 5
+    maxTurnsPerThread: 2
+    maxDiagnosisAttempts: 1
+    maxImplementationAttempts: 1
+    maxReviewCycles: 1
+    maxParallelReaders: 1
+    allowCapableModel: false
+    allowDeepestReasoning: false
+  balanced:
+    maxTotalTokens: 120000
+    maxAgentCalls: 8
+    maxTurnsPerThread: 3
+    maxDiagnosisAttempts: 2
+    maxImplementationAttempts: 2
+    maxReviewCycles: 2
+    maxParallelReaders: 2
+    allowCapableModel: true
+    allowDeepestReasoning: false
+  quality:
+    maxTotalTokens: 250000
+    maxAgentCalls: 12
+    maxTurnsPerThread: 3
+    maxDiagnosisAttempts: 3
+    maxImplementationAttempts: 3
+    maxReviewCycles: 2
+    maxParallelReaders: 3
+    allowCapableModel: true
+    allowDeepestReasoning: true
+  critical:
+    maxTotalTokens: 400000
+    maxAgentCalls: 15
+    maxTurnsPerThread: 3
+    maxDiagnosisAttempts: 3
+    maxImplementationAttempts: 3
+    maxReviewCycles: 3
+    maxParallelReaders: 3
+    allowCapableModel: true
+    allowDeepestReasoning: true
+
+runtime:
+  networkAccessEnabled: false
+  webSearchMode: disabled
+  approvalPolicy: never
+  nativeCodexSubagents: false
+  defaultTimeoutSeconds: 900
+
+context:
+  estimatedInputSoftLimit: 30000
+  estimatedInputHardLimit: 45000
+  reservedOutputTokens: 6000
+  maxRelevantFiles: 12
+  maxEvidenceItems: 30
+  maxErrorExcerpts: 3
+  maxReviewFindings: 12
+  maxExcerptCharacters: 4000
+  tokenEstimateSafetyMultiplier: 1.3
+  includeFullConversation: false
+  includeFullLogs: false
+
+parallelism:
+  enabled: true
+  maxDepth: 1
+  allowNestedAgents: false
+  readOnlyOnly: true
+  oneWriterOnly: true
+  sharedTaskBudget: true
+  nativeCodexSubagents: false
+
+storage:
+  home: null
+  maxCommandLogBytes: 5000000
+  maxEventLogBytes: 10000000
+  lockStaleAfterSeconds: 1800
+
+security:
+  allowNetworkByDefault: false
+  allowDangerFullAccess: false
+  environmentAllowlist: [PATH, HOME, USER, SHELL, TMPDIR, LANG, LC_ALL, TERM]

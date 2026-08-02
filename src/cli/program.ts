@@ -3,13 +3,17 @@ import type { CommanderError } from "commander";
 import type { OutputWriter } from "./output.js";
 import { consoleOutput } from "./output.js";
 import { OrchestratorError } from "../shared/errors.js";
+import { ConfigService } from "../application/configuration/config-service.js";
+import { registerConfigCommand } from "./commands/config.command.js";
 
 export type ProgramDependencies = {
   output?: OutputWriter;
+  configService?: ConfigService;
 };
 
 export function createProgram(dependencies: ProgramDependencies = {}): Command {
   const output = dependencies.output ?? consoleOutput;
+  const configService = dependencies.configService ?? new ConfigService();
   const program = new Command();
 
   program
@@ -17,6 +21,7 @@ export function createProgram(dependencies: ProgramDependencies = {}): Command {
     .description("Safely orchestrate Codex against external Git repositories")
     .version("0.1.0")
     .option("--debug", "show stack traces for errors", false)
+    .option("--json", "emit machine-readable JSON", false)
     .configureOutput({
       writeOut: (message) => output.write(message.trimEnd()),
       writeErr: (message) => output.writeError(message.trimEnd()),
@@ -28,6 +33,8 @@ export function createProgram(dependencies: ProgramDependencies = {}): Command {
       }
       throw commanderErrorToDomainError(error);
     });
+
+  registerConfigCommand(program, configService, output);
 
   return program;
 }
