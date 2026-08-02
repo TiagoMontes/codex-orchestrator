@@ -24,6 +24,8 @@ export type ContextPackInput = {
   worktreeHead?: string;
   diagnosis?: unknown;
   diffHash?: string;
+  diffPatch?: string;
+  verification?: unknown;
   selectedSkills?: ReadonlyArray<{ name: string; sha256: string }>;
 };
 
@@ -41,6 +43,17 @@ export class ContextPackBuilder {
         code: "CONTEXT_INTEGRITY",
       });
     }
+    if (
+      input.phase === "review" &&
+      (input.diffPatch === undefined || input.verification === undefined)
+    ) {
+      throw new OrchestratorError(
+        "Review context requires the exact patch and verification result",
+        {
+          code: "CONTEXT_INTEGRITY",
+        },
+      );
+    }
     const withoutEstimate = {
       schemaVersion: 1 as const,
       contextPackVersion: 1 as const,
@@ -56,8 +69,12 @@ export class ContextPackBuilder {
       sourceCommit: input.sourceCommit,
       ...(input.worktreeHead === undefined ? {} : { worktreeHead: input.worktreeHead }),
       ...(input.diagnosis === undefined ? {} : { diagnosisHash: hashJson(input.diagnosis) }),
+      ...(input.verification === undefined
+        ? {}
+        : { verificationHash: hashJson(input.verification), verification: input.verification }),
       acceptanceCriteriaHash: hashJson(input.task.acceptanceCriteria),
       ...(input.diffHash === undefined ? {} : { diffHash: input.diffHash }),
+      ...(input.diffPatch === undefined ? {} : { diffPatch: input.diffPatch }),
       instructionHashes: input.project.instructionFiles.map(({ relativePath, sha256 }) => ({
         path: relativePath,
         sha256,

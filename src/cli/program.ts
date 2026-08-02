@@ -33,6 +33,10 @@ import { TaskRunService } from "../application/tasks/task-run-service.js";
 import { TaskWorktreeService } from "../application/tasks/task-worktree-service.js";
 import { VerificationFileRepository } from "../infrastructure/persistence/verification-file-repository.js";
 import { registerTaskRunCommand } from "./commands/task-run.command.js";
+import type { TaskReviewer } from "../application/tasks/task-review-service.js";
+import { TaskReviewService } from "../application/tasks/task-review-service.js";
+import { ReviewFileRepository } from "../infrastructure/persistence/review-file-repository.js";
+import { registerTaskReviewCommand } from "./commands/task-review.command.js";
 
 export type ProgramDependencies = {
   output?: OutputWriter;
@@ -42,6 +46,7 @@ export type ProgramDependencies = {
   taskService?: TaskManager;
   taskDiagnosisService?: TaskDiagnosisManager;
   taskRunService?: TaskRunner;
+  taskReviewService?: TaskReviewer;
   codexRuntime?: CodexRuntime;
 };
 
@@ -63,6 +68,7 @@ export function createProgram(dependencies: ProgramDependencies = {}): Command {
   const executionRepository = new ExecutionFileRepository(configService.paths);
   const decisionRepository = new DecisionFileRepository(configService.paths);
   const verificationRepository = new VerificationFileRepository(configService.paths);
+  const reviewRepository = new ReviewFileRepository(configService.paths);
   const taskDiagnosisService =
     dependencies.taskDiagnosisService ??
     new TaskDiagnosisService(
@@ -99,6 +105,22 @@ export function createProgram(dependencies: ProgramDependencies = {}): Command {
       decisionRepository,
       verificationRepository,
     );
+  const taskReviewService =
+    dependencies.taskReviewService ??
+    new TaskReviewService(
+      configService,
+      configService.paths,
+      taskRepository,
+      projectService,
+      codexRuntime,
+      usageRepository,
+      diagnosisRepository,
+      evidenceRepository,
+      executionRepository,
+      decisionRepository,
+      verificationRepository,
+      reviewRepository,
+    );
   const program = new Command();
 
   program
@@ -127,6 +149,7 @@ export function createProgram(dependencies: ProgramDependencies = {}): Command {
   registerTaskQueryCommands(task, program, taskService, configService, output);
   registerTaskDiagnoseCommand(task, program, taskDiagnosisService, output);
   registerTaskRunCommand(task, program, taskRunService, output);
+  registerTaskReviewCommand(task, program, taskReviewService, output);
 
   return program;
 }

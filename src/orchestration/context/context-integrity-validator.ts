@@ -11,6 +11,7 @@ export type CurrentContextIntegrity = {
   sourceCommit: string;
   worktreeHead?: string;
   diagnosis?: unknown;
+  verification?: unknown;
   diffHash?: string;
 };
 
@@ -30,6 +31,9 @@ export class ContextIntegrityValidator {
     const expectedDiagnosis =
       current.diagnosis === undefined ? undefined : hashJson(current.diagnosis);
     if (pack.diagnosisHash !== expectedDiagnosis) mismatches.push("diagnosis hash");
+    const expectedVerification =
+      current.verification === undefined ? undefined : hashJson(current.verification);
+    if (pack.verificationHash !== expectedVerification) mismatches.push("verification hash");
     const currentInstructions = new Map(
       current.project.instructionFiles.map((item) => [item.relativePath, item.sha256]),
     );
