@@ -13,17 +13,17 @@ export async function resolveSafePath(
 ): Promise<string> {
   rejectParentSegments(candidate);
   const absoluteRoot = resolve(root);
-  const absoluteCandidate = isAbsolute(candidate)
-    ? resolve(candidate)
-    : resolve(absoluteRoot, candidate);
-  assertLexicallyContained(absoluteRoot, absoluteCandidate);
-
   const canonicalRoot = await realpath(absoluteRoot).catch((error: unknown) => {
     throw new OrchestratorError(`Allowed root does not exist: ${absoluteRoot}`, {
       code: "PROJECT",
       cause: error,
     });
   });
+  const absoluteCandidate = isAbsolute(candidate)
+    ? resolve(candidate)
+    : resolve(absoluteRoot, candidate);
+  const lexicalRoot = isContained(absoluteRoot, absoluteCandidate) ? absoluteRoot : canonicalRoot;
+  assertLexicallyContained(lexicalRoot, absoluteCandidate);
 
   try {
     const canonicalCandidate = await realpath(absoluteCandidate);
@@ -44,10 +44,10 @@ export async function resolveSafePath(
     }
   }
 
-  const existingAncestor = await nearestExistingAncestor(absoluteCandidate, absoluteRoot);
+  const existingAncestor = await nearestExistingAncestor(absoluteCandidate, lexicalRoot);
   const canonicalAncestor = await realpath(existingAncestor);
   assertCanonicallyContained(canonicalRoot, canonicalAncestor);
-  return resolve(canonicalRoot, relative(absoluteRoot, absoluteCandidate));
+  return resolve(canonicalRoot, relative(lexicalRoot, absoluteCandidate));
 }
 
 export async function canonicalizeExistingPath(path: string): Promise<string> {
