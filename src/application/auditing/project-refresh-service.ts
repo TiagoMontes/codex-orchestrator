@@ -125,7 +125,10 @@ export class ProjectRefreshService implements ProjectRefresher {
     const assessment = this.freshness.assess({
       generation,
       currentHeadCommit: gitMetadata.headCommit,
-      verificationPolicyHash: hashJson(project.verificationPolicy),
+      verificationPolicyHash: hashJson({
+        verificationPolicy: project.verificationPolicy,
+        environmentPolicy: project.environmentPolicy,
+      }),
       instructionHashes: metadata.instructionFiles.map((item) => ({
         path: item.relativePath,
         sha256: item.sha256,

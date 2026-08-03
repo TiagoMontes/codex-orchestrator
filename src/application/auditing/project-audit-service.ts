@@ -257,7 +257,10 @@ export class ProjectAuditService implements ProjectAuditor {
       projectId: project.id,
       sourceCommit,
       currentHeadCommit: sourceCommit,
-      verificationPolicyHash: hashJson(project.verificationPolicy),
+      verificationPolicyHash: hashJson({
+        verificationPolicy: project.verificationPolicy,
+        environmentPolicy: project.environmentPolicy,
+      }),
       instructionHashes: project.instructionFiles.map((item) => ({
         path: item.relativePath,
         sha256: item.sha256,

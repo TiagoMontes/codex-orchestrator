@@ -20,19 +20,30 @@ export function approvedVerificationCommands(
 }
 
 export function verificationPolicyHash(
-  projectOrPolicy: Pick<Project, "verificationPolicy"> | VerificationPolicy,
+  projectOrPolicy:
+    | (Pick<Project, "verificationPolicy"> & Partial<Pick<Project, "environmentPolicy">>)
+    | VerificationPolicy,
 ): string {
   const project =
     "verificationPolicy" in projectOrPolicy
       ? projectOrPolicy
       : { verificationPolicy: projectOrPolicy };
+  const environmentPolicy =
+    "verificationPolicy" in projectOrPolicy
+      ? (projectOrPolicy.environmentPolicy ?? { allowlist: [], secretExceptions: [] })
+      : { allowlist: [], secretExceptions: [] };
   return sha256(
-    stableJson(
-      approvedVerificationCommands(project).map(({ name, argv, timeoutSeconds }) => ({
+    stableJson({
+      schemaVersion: 1,
+      commands: approvedVerificationCommands(project).map(({ name, argv, timeoutSeconds }) => ({
         name,
         argv,
         timeoutSeconds,
       })),
-    ),
+      environment: {
+        allowlist: [...environmentPolicy.allowlist].sort(),
+        secretExceptions: [...environmentPolicy.secretExceptions].sort(),
+      },
+    }),
   );
 }
