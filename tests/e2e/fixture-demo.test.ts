@@ -202,7 +202,7 @@ verification:
         state: { status: "completed" },
         artifacts: {
           diagnosis: { status: "confirmed" },
-          diff: { changedFiles: ["src/bet-service.js", "test/bet-service.test.js"] },
+          diff: { changedFiles: ["src/bet-service.js"] },
           verification: { overallStatus: "passed" },
           review: { verdict: "approve" },
         },
@@ -290,7 +290,7 @@ async function fakeOutput<T>(
       status: "changed",
       summary: "Restored the quantity validation response without changing the contract",
       advisoryChangedFiles: ["src/bet-service.js"],
-      testsAddedOrUpdated: ["test/bet-service.test.js"],
+      testsAddedOrUpdated: [],
       unresolvedRisks: [],
       completedAt: "2026-08-02T12:04:00.000Z",
     };

@@ -20,9 +20,10 @@ describe("verification sandbox plan", () => {
 
     expect(profile).toContain('(subpath "/usr/bin")');
     expect(profile).not.toContain('(subpath "/usr")');
-    expect(profile).not.toContain("/usr/local/etc");
+    expect(profile).not.toContain('(subpath "/usr/local/etc")');
     expect(profile).not.toContain('(subpath "/opt/homebrew/etc")');
     expect(profile).toContain('(literal "/opt/homebrew/etc/openssl@3/openssl.cnf")');
+    expect(profile).toContain('(literal "/usr/local/etc/openssl@3/openssl.cnf")');
     expect(profile).toContain("(deny network*)");
     expect(profile).toContain('(subpath "/private/tmp/project")');
   });

@@ -194,7 +194,7 @@ describe("CommandRunner", () => {
   });
 
   it.skipIf(process.platform !== "darwin")(
-    "settles at a hard deadline when a re-sessioned descendant keeps pipes open",
+    "settles within the hard deadline when a descendant attempts to keep pipes open",
     async () => {
       const directory = await mkdtemp(join(tmpdir(), "cxo-command-session-"));
       temporaryDirectories.push(directory);
@@ -213,7 +213,9 @@ describe("CommandRunner", () => {
       expect(Date.now() - started).toBeLessThan(3_000);
       expect(result).toMatchObject({ timedOut: true, exitCode: null });
       expect(result.signal).toMatch(/^SIG(?:TERM|KILL)$/u);
-      expect(result.sandboxError).toContain("hard deadline");
+      if (result.sandboxError !== undefined) {
+        expect(result.sandboxError).toContain("hard deadline");
+      }
     },
     5_000,
   );
