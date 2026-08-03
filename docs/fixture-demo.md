@@ -28,7 +28,8 @@ edits only the generated worktree; `node --test` is a real child process. The te
 
 - raw feedback is preserved byte-for-byte;
 - normalization, diagnosis, implementation, and review use distinct threads;
-- audit/diagnosis/review are read-only and implementation uses workspace-write in the worktree;
+- audit/diagnosis/review are read-only, diagnosis uses a disposable detached worktree, and
+  implementation uses workspace-write in the persistent task worktree;
 - the exact captured diff passes real verification and receives an independent approval;
 - phase/model usage and event logs are durable;
 - the fixed worktree is dirty and passing;

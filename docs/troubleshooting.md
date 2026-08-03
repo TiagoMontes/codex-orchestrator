@@ -46,6 +46,19 @@ add the intended literal `command` array under `focused` or `full`, inspect it, 
 `approved: true`. The schema also requires a positive timeout and the matching project ID. Commands
 under `candidates` are discovery hints and are never executed. `project refresh` redetects stack
 metadata without overwriting this policy. The CLI never installs dependencies for verification.
+Additional non-secret environment variables can be named under `environment.allowlist`; never put
+values in this file. A sensitive-shaped name also needs a matching `secretExceptions` name and emits
+a warning. Unsafe loader/startup names are always discarded.
+
+On Linux, install `bubblewrap` through the operating system. The orchestrator accepts only a
+root-owned, non-group/world-writable binary (and trusted ancestors) at a fixed system location such
+as `/usr/bin/bwrap`; merely putting a user copy on `PATH` is insufficient. macOS uses the system
+`/usr/bin/sandbox-exec`. If the helper is missing, unsupported, or cannot establish isolation,
+verification is blocked and the configured command is not retried outside the sandbox. User-home
+toolchains and Linux `/opt`-only toolchains are intentionally hidden; linked-worktree Git metadata is
+also outside the command view. Use a visible system toolchain or an outer disposable container.
+Changing an approved command or the project environment-name policy invalidates old verification and
+audit policy hashes; resume or review then requires fresh deterministic verification.
 
 ## Task is blocked
 
@@ -66,7 +79,9 @@ task operation lock.
 
 Status shows phase/model usage and applied overrides. Resume only after choosing a profile or explicit
 `--max-total-tokens`/`--max-agent-calls` value that admits the next bounded call. Do not retry identical
-deterministic failures; new evidence is required.
+deterministic failures; new evidence is required. Failed, cancelled, or crash-interrupted SDK calls
+may show estimated usage equal to the full reservation. This deliberate overcharge prevents an
+unreported provider response from bypassing the hard budget.
 
 ## Source commit or knowledge is stale
 
@@ -79,6 +94,8 @@ cxo project inspect <project>
 
 Existing task diagnosis remains commit-bound. Create/rediagnose at the intended current source rather
 than bypassing the integrity error. Audit artifacts are unusable when affected evidence changed.
+Diagnosis itself uses a temporary detached worktree at the chosen base commit, so a dirty primary
+checkout need not be cleaned; its HEAD and status simply must not change while diagnosis runs.
 
 ## Cleanup refuses a worktree or branch
 

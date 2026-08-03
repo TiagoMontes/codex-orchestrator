@@ -8,7 +8,9 @@ than receiving independent budgets.
 
 Context packs are phase-specific. They include task and acceptance hashes, source/worktree commits,
 instruction hashes, only selected skills, bounded evidence, a bounded relevant-file list, and the
-output schema. Review additionally requires the exact patch, diff hash, and verification result.
+output schema. A bounded normalized task brief carries the title, summary, reports, exact error
+messages, routes, assumptions, unknowns, requested scope, and reproduction notes needed by the phase.
+Review additionally requires the exact patch, diff hash, and verification result.
 
 Input size is estimated with a configurable safety multiplier. Evidence excerpts, failures, findings,
 files, and patch material are capped. Full conversations and full logs are disabled. Crossing the hard
@@ -18,9 +20,12 @@ input limit blocks the phase before an SDK call.
 
 Before a call, `ContextBudgetManager` atomically reserves twice the projected input/output capacity
 and two agent calls: the primary attempt plus either compatibility fallback or structured-output
-repair. A successful call replaces the reservation with actual SDK usage. Failure and cancellation
-release the reservation; safe resume clears crash-stale reservations while holding the operation lock.
-No fallback/repair call starts unless its worst-case capacity was admitted.
+repair. A successful call replaces the reservation with actual SDK usage. If a started call fails or
+is cancelled before usage arrives, the ledger conservatively charges the full reserved calls and
+projected tokens as estimated usage. Safe resume performs the same charge for crash-interrupted
+reservations attached to persisted running attempts, then releases only reservations for which no
+agent attempt was ever durably started. No fallback/repair call starts unless its worst-case capacity
+was admitted.
 
 The durable usage ledger records phase, model, reasoning, thread, worker, calls, token fields, and
 whether usage was actual or estimated. `task status` reports totals and phase/model breakdowns.
@@ -41,14 +46,17 @@ deduplicated evidence and bounded summaries reach the main phase.
 ## Bounded loops
 
 Profiles independently cap diagnosis attempts, implementation attempts, review cycles, turns per
-thread, parallel readers, agent calls, and total tokens. Implementation retry requires a new
-deterministic failure signature. Repeated signatures, unchanged evidence, source movement, exhausted
-budget, cancellation, or a reached limit stop the loop.
+thread, parallel readers, agent calls, and total tokens. Every started or recovered attempt counts.
+Retry input fingerprints bind commit-scoped task/diagnosis/evidence, instructions, selected skills,
+the current diff or failure, and verification policy. An identical fingerprint is rejected;
+repeated deterministic failure signatures also stop the loop. Source movement, exhausted budget,
+cancellation, or a reached limit stop it as well.
 
 The MVP starts a fresh thread for every major phase and bounded retry; it does not carry an unbounded
-same-phase conversation. The rotation policy also rejects future continuation after the turn cap or a
-context threshold. Every new pack retains validated summaries, confirmed evidence, current failures,
-and integrity hashes rather than raw conversation history.
+same-phase conversation. Soft-limit packs are compacted structurally before admission while exact
+criteria, errors, constraints, confirmed causes/evidence, current failure, findings, diff summary,
+and integrity hashes are retained. Rotation reasons and compaction state are persisted and reported;
+the policy rejects future continuation after the turn cap or a context threshold.
 
 ## Profiles
 

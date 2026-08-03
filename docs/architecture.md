@@ -68,10 +68,11 @@ Repository knowledge consists of five commit-scoped artifacts plus a hash manife
 aggregate the normalized task, lifecycle, attempts, phase/model usage, routing decisions, diagnosis,
 diff, verification, and review while checking cross-artifact identities.
 
-`project-config.yaml` is the human-editable verification allowlist. Registration generates it from
-non-executed stack detection; only the narrowly safe exact `node --test` case starts approved. Each
-project lookup strictly validates the file and overlays it onto durable metadata, while refreshes
-preserve user policy edits.
+`project-config.yaml` is the human-editable verification and name-only environment allowlist.
+Registration generates verification entries from non-executed stack detection; only the narrowly
+safe exact `node --test` case starts approved. Environment values never enter state. Each project
+lookup strictly validates the file and overlays it onto durable metadata, while refreshes preserve
+user policy edits.
 
 The application owns parallelism. Task phases may partition independent reports/files into bounded
 depth-one readers, then inject only validated, deduplicated evidence into the main phase. One writer

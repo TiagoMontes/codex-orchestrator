@@ -28,24 +28,34 @@ are terminal. A blocked/cancelled document records the prior state as `resumable
   persisted focused findings.
 
 Resume obtains task/project operation locks, so the old process must finish cancellation first. It
-releases crash-stale budget reservations and checks
-task/state synchronization, source commit, primary HEAD, worktree registration and branch, base
-ancestry, diff hash, and verification identity before changing state. Attempt and review-cycle counts
-come from durable execution history and cannot be reset by restarting the CLI.
+conservatively charges crash-interrupted reservations that belong to persisted running attempts and
+releases only unattached pre-call reservations. It checks task/state synchronization, source commit,
+primary HEAD, worktree registration and branch, base ancestry, diff hash, verification identity, and
+verification-policy hash before changing state. Attempt and review-cycle counts come from durable
+execution history and cannot be reset by restarting the CLI. Persisted validated phase checkpoints
+are replayed without another model call only after their semantic inputs and live Git evidence still
+match.
+
+Every diagnosis runs in a unique disposable detached worktree at the task base commit. Only approved
+focused verification commands may run there as reproduction, and each must leave the detached tree
+clean. The primary checkout may begin dirty, but its exact HEAD/status snapshot must remain unchanged.
 
 ## Cancellation
 
 `task cancel` uses revision compare-and-swap with bounded retry so a concurrent phase transition
 cannot silently lose the request. Active services poll persisted state and combine it with caller
 signals. SDK calls and verification children receive the linked abort signal. Attempts become
-`cancelled`, usage reservations are released, and the primary checkout remains unchanged.
+`cancelled`; started calls without actual usage are conservatively charged at their admitted maximum,
+and the primary checkout remains unchanged.
 
 ## Verification and review
 
 An implementer result never determines the diff. Git captures the real worktree patch relative to the
-diagnosed base and hashes it. Approved verification argv run in order; each log, excerpt, status, and
-hash is persisted. Cancellation terminates the active command (and prevents the next one) while
-preserving partial evidence.
+diagnosed base and hashes it. Approved verification argv run in order inside the fail-closed host
+sandbox; each log, excerpt, status, and hash is persisted together with the effective command and
+name-only environment-policy hash.
+Cancellation terminates the active process group (and prevents the next command) while preserving
+partial evidence.
 
 The reviewer starts a fresh read-only thread against the exact diff. It must assess every required
 criterion exactly once and bind findings to evidence/current changed files. Changes requested enter a

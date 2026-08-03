@@ -20,6 +20,7 @@ all task operations and worktrees are safely resolved; it never deletes the regi
 - Git with worktree support
 - local Codex authentication usable by `@openai/codex-sdk`
 - pnpm 10 for development or source installation
+- on Linux, a system-installed, root-owned, non-group/world-writable `bwrap` at a fixed system path
 
 Run `cxo doctor` before creating a task. `cxo doctor --deep` is optional and clearly warns before
 making one tiny read-only model call.
@@ -78,11 +79,22 @@ literal `command` argument arrays, timeouts, and an explicit `approved` flag. Ge
 stay disabled; inspect and approve only commands you trust. The file is strictly validated on every
 project lookup, and `project refresh` preserves user edits while refreshing detected metadata. See
 [`templates/project.config.example.yaml`](templates/project.config.example.yaml).
+The same file can allow additional environment variables by name under `environment.allowlist`;
+values are inherited at execution time and never persisted. Sensitive-looking names require an
+explicit name-only `secretExceptions` entry and produce a warning, while loader/startup variables
+remain unconditionally denied.
+
+`task diagnose` snapshots the primary checkout, creates a disposable detached worktree at the exact
+task base commit, runs only explicitly approved `focused` commands as deterministic reproduction,
+and removes that worktree afterward. An already-dirty primary checkout is allowed but must remain
+byte-for-byte unchanged in Git HEAD/status throughout diagnosis.
 
 `task run` creates a state-owned worktree and task branch at the diagnosed commit. Codex may write
 only there. The primary checkout's HEAD, status, and contents are checked throughout the workflow.
 Verification runs approved literal argv outside the model; review starts a new thread and is bound to
-the exact source commit and diff hash.
+the exact source commit, diff hash, and effective project command/environment-policy hash.
+Verification also runs inside a fail-closed host sandbox: macOS Seatbelt or Linux bubblewrap. A
+missing/unsupported sandbox blocks verification instead of running the command directly.
 
 If a bounded phase stops:
 
@@ -138,6 +150,13 @@ cxo task cleanup <task-id> [--remove-worktree] [--delete-branch]
 Execution commands accept bounded overrides for `--profile`, `--model`, `--reasoning`,
 `--max-total-tokens`, `--max-agent-calls`, `--parallel-readers`, `--allow-network`, `--base-ref`, and
 `--timeout`. Applied overrides and routing decisions are persisted and shown in task reports.
+
+Human-readable audit/create/diagnose/run/review commands stream concise redacted lifecycle, safe tool
+completion, and usage progress. `--json` suppresses progress so stdout remains one machine-readable
+document. Git invocations and exit codes are stored in bounded redacted JSONL logs under the global,
+project, or task `runs/git.jsonl` directory, depending on scope.
+Each record carries its available project/task, phase, execution, and thread correlation fields and
+uses the current `storage.maxCommandLogBytes` cap.
 
 For task diagnosis, pre-write implementation exploration, and review, `--parallel-readers N`
 launches workers only when the planner finds at least two disjoint reports or file scopes. Workers
@@ -269,8 +288,19 @@ context pack.
   `node --test`. PHP, Python, Rust, Go, and alternate Node commands remain disabled candidates until the
   user explicitly approves literal argument arrays in the state-owned project configuration.
   Dependency installation is never automatic.
-- Verification uses an allowlisted literal argv and sanitized environment, but the host OS—not the
-  CLI—determines process-level network isolation.
+- Deterministic verification requires `/usr/bin/sandbox-exec` on macOS or `bwrap` on Linux. Other
+  platforms fail closed. The macOS sandbox denies network and non-worktree writes, while process-tree
+  termination uses a hard completion deadline, but a deliberately re-sessioned daemon can leave the
+  original Unix process group; it remains subject to the inherited Seatbelt policy and can still
+  access the allowed worktree until it exits. Linux bubblewrap additionally
+  uses fresh PID, proc, IPC, UTS, and network namespaces plus an allowlisted read-only system view.
+  Broad `/usr`, `/opt`, and configuration roots are not exposed. The macOS Command Line Tools and
+  enumerated Homebrew runtime trees are visible; only the literal OpenSSL runtime configuration file
+  is exposed, not its configuration/private directory. Toolchains installed only under a user home
+  (and Linux toolchains living only under `/opt`) are intentionally hidden and may require a system
+  installation or an outer disposable container.
+  These controls are defense in depth, not a substitute for running hostile project tests in a
+  disposable VM/container.
 - Project audits require a clean checkout and inventory at most 5,000 tracked files. They are
   commit-scoped snapshots; changed evidence, repository instructions, or selected skill hashes make
   them unusable until a new audit.
