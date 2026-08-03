@@ -14,20 +14,26 @@ import type { Evidence } from "../../domain/evidence/evidence.js";
 import type { DiffArtifact } from "../../domain/execution/diff-artifact.js";
 import type { ExecutionAttempt } from "../../domain/execution/execution-attempt.js";
 import { implementationResultSchema } from "../../domain/execution/implementation-result.js";
-import type { ModelDecision } from "../../domain/execution/model-decision.js";
+import { modelDecisionSchema, type ModelDecision } from "../../domain/execution/model-decision.js";
 import type { Project } from "../../domain/project/project.js";
 import type { ReviewFinding, ReviewResult } from "../../domain/review/review.js";
 import { reviewResultSchema } from "../../domain/review/review.js";
 import type { TaskStateDocument } from "../../domain/task/task-state.js";
 import type { Task } from "../../domain/task/task.js";
 import type { UsageLedgerDocument } from "../../domain/usage/usage-ledger.js";
-import type { NormalizedUsage } from "../../domain/usage/usage.js";
+import { normalizedUsageSchema, type NormalizedUsage } from "../../domain/usage/usage.js";
 import type { VerificationResult } from "../../domain/verification/verification.js";
-import type { CodexRuntime } from "../../infrastructure/codex/codex-runtime.js";
+import type {
+  CodexProgressObserver,
+  CodexRuntime,
+} from "../../infrastructure/codex/codex-runtime.js";
 import { resolveSafePath } from "../../infrastructure/filesystem/path-safety.js";
 import { DiffService } from "../../infrastructure/git/diff-service.js";
 import { GitClient } from "../../infrastructure/git/git-client.js";
-import { GitCommandLog } from "../../infrastructure/git/git-command-log.js";
+import {
+  GitCommandLog,
+  type GitCommandCorrelation,
+} from "../../infrastructure/git/git-command-log.js";
 import { RepositoryLock } from "../../infrastructure/git/repository-lock.js";
 import { WorktreeManager } from "../../infrastructure/git/worktree-manager.js";
 import { AtomicJsonStore } from "../../infrastructure/persistence/atomic-json-store.js";
@@ -49,6 +55,7 @@ import { sha256, stableJson } from "../../shared/hashing.js";
 import { ContextBudgetManager } from "../../orchestration/context/context-budget-manager.js";
 import { ContextIntegrityValidator } from "../../orchestration/context/context-integrity-validator.js";
 import { ContextPackBuilder } from "../../orchestration/context/context-pack-builder.js";
+import { assertStructuredOutputBounded } from "../../orchestration/context/structured-output-bound.js";
 import { TaskStateMachine } from "../../orchestration/engine/state-machine.js";
 import { ModelRouter, type RoutingOverrides } from "../../orchestration/routing/model-router.js";
 import { ParallelReadCoordinator } from "../../orchestration/parallel/parallel-read-coordinator.js";
@@ -57,6 +64,34 @@ import { VerificationService } from "./verification-service.js";
 import { SkillRegistry } from "../skills/skill-registry.js";
 import { PersistedTaskCancellation } from "./persisted-task-cancellation.js";
 import { executionFailureStatus, taskFailureStatus } from "./task-failure-policy.js";
+import { verificationPolicyHash } from "./verification-policy.js";
+import {
+  assertRetryHasNewEvidence,
+  executionInputFingerprint,
+  latestFailureObservation,
+} from "./execution-input-fingerprint.js";
+import { semanticEvidenceInput } from "../../orchestration/context/evidence-fingerprint.js";
+import { reviewCorrectionCheckpointSchema } from "./review-correction-checkpoint.js";
+import { projectAtWorkingRoot } from "../projects/project-working-copy.js";
+import { writerRuntimeCheckpointSchema } from "./writer-runtime-checkpoint.js";
+
+const reviewCheckpointSchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    executionId: z.string().uuid(),
+    taskId: z.string().min(1),
+    sourceCommit: z.string().min(1),
+    diffHash: z.string().regex(/^[a-f0-9]{64}$/u),
+    policyHash: z.string().regex(/^[a-f0-9]{64}$/u),
+    inputFingerprint: z.string().regex(/^[a-f0-9]{64}$/u),
+    review: reviewResultSchema,
+    modelDecision: modelDecisionSchema,
+    usage: normalizedUsageSchema,
+    threadId: z.string().min(1),
+    runtimeAttempts: z.number().int().positive(),
+    completedAt: z.string().datetime(),
+  })
+  .strict();
 
 export type TaskReviewOverrides = {
   profile?: ExecutionProfile;
@@ -68,6 +103,7 @@ export type TaskReviewOverrides = {
   allowNetwork?: boolean;
   baseRef?: string;
   timeoutMs?: number;
+  progress?: CodexProgressObserver;
   abortSignal?: AbortSignal;
 };
 
@@ -139,8 +175,7 @@ export class TaskReviewService implements TaskReviewer {
     taskId: string,
     overrides: TaskReviewOverrides,
   ): Promise<TaskReviewReport> {
-    let task = await this.tasks.get(taskId);
-    let state = await this.tasks.getState(taskId);
+    let { task, state } = await this.tasks.getSnapshot(taskId);
     if (
       state.status !== "reviewing" ||
       task.worktree === undefined ||
@@ -161,7 +196,8 @@ export class TaskReviewService implements TaskReviewer {
       assertReviewInputs(task, diagnosis);
       const config = applyReviewOverrides(await this.configService.load(), overrides, task.profile);
       const profile = overrides.profile ?? task.profile;
-      const git = this.scopedGit(task);
+      const gitCorrelation: GitCommandCorrelation = { phase: "review" };
+      const git = this.scopedGit(task, gitCorrelation);
       const worktree = await new WorktreeManager(this.paths, git).inspect(
         project.gitRoot,
         task.worktree.path,
@@ -175,12 +211,6 @@ export class TaskReviewService implements TaskReviewer {
         head: await git.resolveCommit(project.gitRoot, "HEAD"),
         status: await git.statusPorcelain(project.gitRoot),
       };
-      if (primary.head !== diagnosis.sourceCommit) {
-        throw new OrchestratorError("Primary source commit changed before review", {
-          code: "CONTEXT_INTEGRITY",
-          resumable: true,
-        });
-      }
       if (overrides.baseRef !== undefined) {
         const overrideCommit = await git.resolveCommit(project.gitRoot, overrides.baseRef);
         if (overrideCommit !== diagnosis.sourceCommit) {
@@ -192,21 +222,35 @@ export class TaskReviewService implements TaskReviewer {
       const diffService = new DiffService(this.paths, git, undefined, undefined, this.clock);
       let diff = await diffService.read(project.id, task.id);
       let verification = await this.verificationRepository.read(project.id, task.id);
-      await assertReviewArtifacts(diffService, diff, verification, worktree.path, diagnosis);
+      await assertReviewArtifacts(
+        diffService,
+        diff,
+        verification,
+        worktree.path,
+        diagnosis,
+        verificationPolicyHash(project),
+      );
       let patch = await diffService.readPersistedPatch(diff, project.id, task.id);
       const evidence = await this.evidenceRepository.read(project.id, task.id);
       const reviewResults: ReviewResult[] = [];
       const corrections: ExecutionAttempt[] = [];
       const maximumCycles = config.profiles[profile].maxReviewCycles;
-      const priorReviewCycles = (await this.executions.list(project.id, task.id)).filter(
+      const priorReviewAttempts = (await this.executions.list(project.id, task.id)).filter(
         (attempt) => attempt.phase === "review",
-      ).length;
-      if (priorReviewCycles >= maximumCycles) {
+      );
+      let recoveredReviewer = await this.readRecoveredReviewer({
+        task,
+        project,
+        diff,
+        verification,
+        attempts: priorReviewAttempts,
+      });
+      if (priorReviewAttempts.length >= maximumCycles && recoveredReviewer === undefined) {
         return this.stopTask(task, state, "review_cycle_limit_reached");
       }
       const persistedOverrides = Object.fromEntries(
         Object.entries(overrides).filter(
-          ([key, value]) => key !== "abortSignal" && value !== undefined,
+          ([key, value]) => key !== "abortSignal" && key !== "progress" && value !== undefined,
         ),
       );
       if (Object.keys(persistedOverrides).length > 0) {
@@ -244,7 +288,7 @@ export class TaskReviewService implements TaskReviewer {
           },
         });
       }
-      if (parallelPlan.mode === "parallel") {
+      if (parallelPlan.mode === "parallel" && recoveredReviewer === undefined) {
         const parallel = await new ParallelReadCoordinator(
           config,
           this.paths,
@@ -266,6 +310,7 @@ export class TaskReviewService implements TaskReviewer {
             ...(overrides.model === undefined ? {} : { model: overrides.model }),
             ...(overrides.reasoning === undefined ? {} : { reasoning: overrides.reasoning }),
             ...(overrides.timeoutMs === undefined ? {} : { timeoutMs: overrides.timeoutMs }),
+            ...(overrides.progress === undefined ? {} : { progress: overrides.progress }),
             ...(overrides.abortSignal === undefined ? {} : { abortSignal: overrides.abortSignal }),
           },
         });
@@ -273,25 +318,33 @@ export class TaskReviewService implements TaskReviewer {
         evidence.splice(0, evidence.length, ...consolidated);
       }
 
-      for (let cycle = priorReviewCycles + 1; cycle <= maximumCycles; cycle += 1) {
+      for (
+        let cycle = recoveredReviewer?.execution.attemptNumber ?? priorReviewAttempts.length + 1;
+        cycle <= maximumCycles;
+        cycle += 1
+      ) {
         if (overrides.abortSignal?.aborted ?? false) {
           throw new OrchestratorError("Task review was cancelled", { code: "CANCELLED" });
         }
         await this.assertPrimaryUnchanged(git, project.gitRoot, primary);
-        const reviewer = await this.runReviewer({
-          config,
-          profile,
-          task,
-          project,
-          diagnosis,
-          worktreePath: worktree.path,
-          diff,
-          patch,
-          verification,
-          evidence,
-          cycle,
-          overrides,
-        });
+        const reviewer =
+          recoveredReviewer ??
+          (await this.runReviewer({
+            config,
+            profile,
+            task,
+            project,
+            diagnosis,
+            worktreePath: worktree.path,
+            diff,
+            patch,
+            verification,
+            evidence,
+            cycle,
+            overrides,
+            gitCorrelation,
+          }));
+        recoveredReviewer = undefined;
         await diffService.assertCurrent(diff, worktree.path);
         let validated: Awaited<ReturnType<TaskReviewService["validateReview"]>>;
         try {
@@ -302,6 +355,7 @@ export class TaskReviewService implements TaskReviewer {
             evidence,
             worktree.path,
             cycle,
+            config,
           );
         } catch (error) {
           const normalized = toOrchestratorError(error);
@@ -346,6 +400,13 @@ export class TaskReviewService implements TaskReviewer {
         }
         if (validated.review.verdict === "approve" && completionIssues.length === 0) {
           await diffService.assertCurrent(diff, worktree.path);
+          const currentProject = await this.projects.inspect(project.id);
+          if (verification.policyHash !== verificationPolicyHash(currentProject)) {
+            throw new OrchestratorError(
+              "Verification policy changed after the passing result was captured",
+              { code: "CONTEXT_INTEGRITY", resumable: true },
+            );
+          }
           await this.assertPrimaryUnchanged(git, project.gitRoot, primary);
           ({ task, state } = await this.transition(
             task,
@@ -387,6 +448,7 @@ export class TaskReviewService implements TaskReviewer {
           cycle,
           overrides,
           diffService,
+          gitCorrelation,
         });
         let correctionFinalized = false;
         try {
@@ -423,21 +485,49 @@ export class TaskReviewService implements TaskReviewer {
             diffService,
             this.clock,
           );
-          const verificationReport = await verificationService.verify({
-            task,
-            project,
-            worktreePath: worktree.path,
-            diff: correction.diff,
-            executionId: correction.execution.id,
-            ...(overrides.abortSignal === undefined ? {} : { abortSignal: overrides.abortSignal }),
-          });
+          const currentProject = await this.projects.inspect(project.id);
+          if (verificationPolicyHash(currentProject) !== verificationPolicyHash(project)) {
+            throw new OrchestratorError("Verification policy changed during review correction", {
+              code: "CONTEXT_INTEGRITY",
+              resumable: true,
+            });
+          }
+          let verificationReport: Awaited<ReturnType<VerificationService["verify"]>>;
+          try {
+            verificationReport = await verificationService.verify({
+              task,
+              project: currentProject,
+              worktreePath: worktree.path,
+              diff: correction.diff,
+              executionId: correction.execution.id,
+              ...(overrides.abortSignal === undefined
+                ? {}
+                : { abortSignal: overrides.abortSignal }),
+            });
+          } finally {
+            await this.assertPrimaryUnchanged(git, project.gitRoot, primary);
+          }
+          if (
+            verificationReport.result.policyHash !==
+            verificationPolicyHash(await this.projects.inspect(project.id))
+          ) {
+            throw new OrchestratorError(
+              "Verification policy changed while review correction commands were running",
+              { code: "CONTEXT_INTEGRITY", resumable: true },
+            );
+          }
           for (const item of verificationReport.evidence) {
             if (!evidence.some((existing) => existing.id === item.id)) evidence.push(item);
           }
           const correctionExecution: ExecutionAttempt = {
             ...correction.execution,
             completedAt: isoNow(this.clock),
-            status: verificationReport.result.overallStatus === "passed" ? "succeeded" : "failed",
+            status:
+              verificationReport.result.overallStatus === "passed"
+                ? "succeeded"
+                : verificationReport.result.overallStatus === "blocked"
+                  ? "blocked"
+                  : "failed",
             threadId: correction.threadId,
             usage: correction.usage,
             resultArtifactPath: correction.resultArtifactPath,
@@ -492,8 +582,7 @@ export class TaskReviewService implements TaskReviewer {
       return this.stopTask(task, state, "review_cycle_limit_reached");
     } catch (error) {
       let normalized = toOrchestratorError(error);
-      task = await this.tasks.get(task.id);
-      state = await this.tasks.getState(task.id);
+      ({ task, state } = await this.tasks.getSnapshot(task.id));
       if (state.status === "cancelled" && normalized.code !== "CANCELLED") {
         normalized = new OrchestratorError("Task review was cancelled", {
           code: "CANCELLED",
@@ -511,9 +600,120 @@ export class TaskReviewService implements TaskReviewer {
       }
       throw normalized;
     } finally {
-      cancellation.dispose(callerSignal);
+      await cancellation.dispose(callerSignal);
       await lock.release();
     }
+  }
+
+  private async readRecoveredReviewer(input: {
+    task: Task;
+    project: Project;
+    diff: DiffArtifact;
+    verification: VerificationResult;
+    attempts: readonly ExecutionAttempt[];
+  }): Promise<
+    | {
+        review: ReviewResult;
+        execution: ExecutionAttempt;
+        threadId: string;
+        usage: NormalizedUsage;
+      }
+    | undefined
+  > {
+    for (const attempt of [...input.attempts].reverse()) {
+      let checkpoint: z.infer<typeof reviewCheckpointSchema> | undefined;
+      try {
+        checkpoint = await this.store.read(
+          this.reviewCheckpointPath(input.project.id, input.task.id, attempt.id),
+          reviewCheckpointSchema,
+        );
+      } catch (error) {
+        if (!isMissingStateDocument(error)) throw error;
+      }
+      if (checkpoint !== undefined) {
+        const interruptedAtSafeBoundary =
+          attempt.error?.message === "Interrupted execution reconciled at the safe resume boundary";
+        if (!["running", "succeeded"].includes(attempt.status) && !interruptedAtSafeBoundary) {
+          // A checkpoint is written before semantic review validation. A terminal
+          // validation failure must become new retry evidence, not be replayed forever.
+          continue;
+        }
+        if (
+          checkpoint.executionId !== attempt.id ||
+          checkpoint.taskId !== input.task.id ||
+          checkpoint.inputFingerprint !== attempt.inputFingerprint ||
+          stableJson(checkpoint.modelDecision) !== stableJson(attempt.modelDecision)
+        ) {
+          throw new OrchestratorError("Review recovery checkpoint is incompatible", {
+            code: "CONTEXT_INTEGRITY",
+          });
+        }
+        if (
+          checkpoint.sourceCommit !== input.diff.sourceCommit ||
+          checkpoint.diffHash !== input.diff.diffHash ||
+          checkpoint.policyHash !== verificationPolicyHash(input.project) ||
+          input.verification.diffHash !== input.diff.diffHash ||
+          input.verification.policyHash !== checkpoint.policyHash ||
+          input.verification.overallStatus !== "passed"
+        ) {
+          continue;
+        }
+        if (attempt.reservationId !== undefined) {
+          await this.usage.commitReservation({
+            projectId: input.project.id,
+            taskId: input.task.id,
+            reservationId: attempt.reservationId,
+            model: checkpoint.modelDecision.model,
+            reasoning: checkpoint.modelDecision.reasoning,
+            usage: checkpoint.usage,
+            agentCalls: checkpoint.runtimeAttempts,
+            threadId: checkpoint.threadId,
+          });
+        }
+        return {
+          review: checkpoint.review,
+          execution: withoutExecutionError(attempt),
+          threadId: checkpoint.threadId,
+          usage: checkpoint.usage,
+        };
+      }
+
+      let review: ReviewResult;
+      try {
+        review = await this.reviews.readForExecution(input.project.id, input.task.id, attempt.id);
+      } catch (error) {
+        if (isMissingStateDocument(error)) continue;
+        throw error;
+      }
+      if (
+        review.taskId !== input.task.id ||
+        review.sourceCommit !== input.diff.sourceCommit ||
+        review.reviewedDiffHash !== input.diff.diffHash ||
+        input.verification.diffHash !== input.diff.diffHash ||
+        input.verification.policyHash !== verificationPolicyHash(input.project) ||
+        input.verification.overallStatus !== "passed"
+      ) {
+        continue;
+      }
+      const ledger = await this.usage.read(input.project.id, input.task.id);
+      const usageEntry = ledger.entries.find(
+        (entry) => entry.reservationId === attempt.reservationId,
+      );
+      const usage = attempt.usage ?? usageEntry?.usage;
+      const threadId = attempt.threadId ?? usageEntry?.threadId;
+      if (usage === undefined || threadId === undefined) {
+        throw new OrchestratorError("Review checkpoint is missing its committed runtime usage", {
+          code: "CONTEXT_INTEGRITY",
+        });
+      }
+      return {
+        review,
+        execution: withoutExecutionError(attempt),
+        threadId,
+        usage,
+      };
+    }
+    return undefined;
   }
 
   private async runReviewer(input: {
@@ -529,6 +729,7 @@ export class TaskReviewService implements TaskReviewer {
     evidence: Evidence[];
     cycle: number;
     overrides: TaskReviewOverrides;
+    gitCorrelation: GitCommandCorrelation;
   }): Promise<{
     review: ReviewResult;
     execution: ExecutionAttempt;
@@ -536,17 +737,28 @@ export class TaskReviewService implements TaskReviewer {
     usage: NormalizedUsage;
   }> {
     const executionId = randomUUID();
-    const worktreeHead = await this.scopedGit(input.task).resolveCommit(input.worktreePath, "HEAD");
+    input.gitCorrelation.phase = "review";
+    input.gitCorrelation.executionId = executionId;
+    delete input.gitCorrelation.threadId;
+    const worktreeHead = await this.scopedGit(input.task, input.gitCorrelation).resolveCommit(
+      input.worktreePath,
+      "HEAD",
+    );
+    const phaseProject = await projectAtWorkingRoot(
+      input.project,
+      input.worktreePath,
+      input.diagnosis.sourceCommit,
+    );
     const selectedSkills = await this.skillRegistry.select({
       phase: "review",
       task: input.task,
-      project: input.project,
+      project: phaseProject,
     });
     const pack = new ContextPackBuilder(input.config).build({
       phase: "review",
       objective: `Independently review the exact diff for ${input.task.title}`,
       task: input.task,
-      project: input.project,
+      project: phaseProject,
       sourceCommit: input.diagnosis.sourceCommit,
       worktreeHead,
       diagnosis: input.diagnosis,
@@ -560,15 +772,55 @@ export class TaskReviewService implements TaskReviewer {
       selectedSkills,
       outputSchema: toJsonSchema(reviewResultSchema),
     });
-    await this.integrity.assertLiveInstructionFiles(pack, {
-      task: input.task,
-      project: input.project,
+    await this.integrity.assertLiveInstructionFiles(
+      pack,
+      {
+        task: input.task,
+        project: phaseProject,
+        sourceCommit: input.diagnosis.sourceCommit,
+        worktreeHead,
+        diagnosis: input.diagnosis,
+        verification: input.verification,
+        diffHash: input.diff.diffHash,
+      },
+      input.worktreePath,
+    );
+    const priorReviewAttempts = (
+      await this.executions.list(input.project.id, input.task.id)
+    ).filter((attempt) => attempt.phase === "review");
+    const inputFingerprint = executionInputFingerprint({
+      phase: "review",
       sourceCommit: input.diagnosis.sourceCommit,
-      worktreeHead,
+      task: reviewTaskInput(input.task),
       diagnosis: input.diagnosis,
-      verification: input.verification,
       diffHash: input.diff.diffHash,
+      verification: {
+        diffHash: input.verification.diffHash,
+        policyHash: input.verification.policyHash,
+        overallStatus: input.verification.overallStatus,
+        commands: input.verification.commands.map(({ name, argv, status, logSha256 }) => ({
+          name,
+          argv,
+          status,
+          logSha256,
+        })),
+      },
+      evidence: input.evidence.map(semanticEvidenceInput),
+      priorFailure: latestFailureObservation(priorReviewAttempts),
+      selectedSkills: selectedSkills.map(
+        ({ name, source, sha256: skillSha256, instructionsSha256 }) => ({
+          name,
+          source,
+          sha256: skillSha256,
+          instructionsSha256,
+        }),
+      ),
+      instructions: phaseProject.instructionFiles.map(({ relativePath, sha256 }) => ({
+        relativePath,
+        sha256,
+      })),
     });
+    assertRetryHasNewEvidence(priorReviewAttempts, inputFingerprint, "Review");
     const contextPackPath = join(
       this.paths.taskDirectory(input.project.id, input.task.id),
       "context-packs",
@@ -597,6 +849,8 @@ export class TaskReviewService implements TaskReviewer {
       taskId: input.task.id,
       phase: "review",
       attemptNumber: input.cycle,
+      reservationId: setup.reservationId,
+      inputFingerprint,
       modelDecision: setup.modelDecision,
       sandboxMode: "read-only",
       contextPackPath,
@@ -605,7 +859,13 @@ export class TaskReviewService implements TaskReviewer {
       status: "running",
       eventsPath,
     };
-    await this.executions.save(input.project.id, execution);
+    try {
+      await this.executions.save(input.project.id, execution);
+    } catch (error) {
+      await this.usage.releaseReservation(input.project.id, input.task.id, setup.reservationId);
+      throw error;
+    }
+    let callStarted = false;
     try {
       const prompt = await this.promptLoader.render("review.prompt.md", {
         TASK_ID: input.task.id,
@@ -613,6 +873,9 @@ export class TaskReviewService implements TaskReviewer {
         DIFF_HASH: input.diff.diffHash,
         CONTEXT_PACK: stableJson(pack),
       });
+      execution = { ...execution, callStartedAt: isoNow(this.clock) };
+      await this.executions.save(input.project.id, execution);
+      callStarted = true;
       const result = await this.runtime.runStructured({
         role: "reviewer",
         prompt,
@@ -626,10 +889,35 @@ export class TaskReviewService implements TaskReviewer {
         outputValidator: reviewResultSchema,
         timeoutMs: input.overrides.timeoutMs ?? input.config.runtime.defaultTimeoutSeconds * 1_000,
         eventsPath,
+        additionalAllowedEnvironmentNames: phaseProject.environmentPolicy.allowlist,
+        explicitSecretEnvironmentExceptions: phaseProject.environmentPolicy.secretExceptions,
+        ...(input.overrides.progress === undefined ? {} : { progress: input.overrides.progress }),
         ...(input.overrides.abortSignal === undefined
           ? {}
           : { abortSignal: input.overrides.abortSignal }),
       });
+      input.gitCorrelation.threadId = result.threadId;
+      assertStructuredOutputBounded(result.output, input.config);
+      const review = reviewResultSchema.parse(result.output);
+      const completedAt = isoNow(this.clock);
+      await this.store.write(
+        this.reviewCheckpointPath(input.project.id, input.task.id, executionId),
+        {
+          schemaVersion: 1,
+          executionId,
+          taskId: input.task.id,
+          sourceCommit: input.diagnosis.sourceCommit,
+          diffHash: input.diff.diffHash,
+          policyHash: input.verification.policyHash,
+          inputFingerprint,
+          review,
+          modelDecision: setup.modelDecision,
+          usage: result.usage,
+          threadId: result.threadId,
+          runtimeAttempts: result.runtimeAttempts,
+          completedAt,
+        },
+      );
       await this.usage.commitReservation({
         projectId: input.project.id,
         taskId: input.task.id,
@@ -641,15 +929,23 @@ export class TaskReviewService implements TaskReviewer {
         threadId: result.threadId,
       });
       return {
-        review: reviewResultSchema.parse(result.output),
+        review,
         execution,
         threadId: result.threadId,
         usage: result.usage,
       };
     } catch (error) {
-      await this.usage
-        .releaseReservation(input.project.id, input.task.id, setup.reservationId)
-        .catch(() => undefined);
+      await (
+        !callStarted
+          ? this.usage.releaseReservation(input.project.id, input.task.id, setup.reservationId)
+          : this.usage.commitFailedReservation({
+              projectId: input.project.id,
+              taskId: input.task.id,
+              reservationId: setup.reservationId,
+              model: setup.modelDecision.model,
+              reasoning: setup.modelDecision.reasoning,
+            })
+      ).catch(() => undefined);
       let normalized = toOrchestratorError(error);
       if (input.overrides.abortSignal?.aborted ?? false) {
         normalized = new OrchestratorError("Task review was cancelled", {
@@ -687,6 +983,7 @@ export class TaskReviewService implements TaskReviewer {
     cycle: number;
     overrides: TaskReviewOverrides;
     diffService: DiffService;
+    gitCorrelation: GitCommandCorrelation;
   }): Promise<{
     execution: ExecutionAttempt;
     threadId: string;
@@ -695,7 +992,18 @@ export class TaskReviewService implements TaskReviewer {
     resultArtifactPath: string;
   }> {
     const executionId = randomUUID();
-    const worktreeHead = await this.scopedGit(input.task).resolveCommit(input.worktreePath, "HEAD");
+    input.gitCorrelation.phase = "correction";
+    input.gitCorrelation.executionId = executionId;
+    delete input.gitCorrelation.threadId;
+    const worktreeHead = await this.scopedGit(input.task, input.gitCorrelation).resolveCommit(
+      input.worktreePath,
+      "HEAD",
+    );
+    const phaseProject = await projectAtWorkingRoot(
+      input.project,
+      input.worktreePath,
+      input.diagnosis.sourceCommit,
+    );
     const focusedReview = {
       verdict: input.review.verdict,
       findings: input.review.findings.slice(0, input.config.context.maxReviewFindings),
@@ -707,13 +1015,13 @@ export class TaskReviewService implements TaskReviewer {
     const selectedSkills = await this.skillRegistry.select({
       phase: "correction",
       task: input.task,
-      project: input.project,
+      project: phaseProject,
     });
     const pack = new ContextPackBuilder(input.config).build({
       phase: "correction",
       objective: `Correct focused independent-review findings for ${input.task.title}`,
       task: input.task,
-      project: input.project,
+      project: phaseProject,
       sourceCommit: input.diagnosis.sourceCommit,
       worktreeHead,
       diagnosis: input.diagnosis,
@@ -731,14 +1039,45 @@ export class TaskReviewService implements TaskReviewer {
       selectedSkills,
       outputSchema: toJsonSchema(implementationResultSchema),
     });
-    await this.integrity.assertLiveInstructionFiles(pack, {
-      task: input.task,
-      project: input.project,
+    await this.integrity.assertLiveInstructionFiles(
+      pack,
+      {
+        task: input.task,
+        project: phaseProject,
+        sourceCommit: input.diagnosis.sourceCommit,
+        worktreeHead,
+        diagnosis: input.diagnosis,
+        diffHash: input.diff.diffHash,
+      },
+      input.worktreePath,
+    );
+    const priorCorrections = (await this.executions.list(input.project.id, input.task.id)).filter(
+      (attempt) =>
+        attempt.phase === "correction" && attempt.contextPackPath.includes("/review-correction-"),
+    );
+    const inputFingerprint = executionInputFingerprint({
+      phase: "review-correction",
       sourceCommit: input.diagnosis.sourceCommit,
-      worktreeHead,
+      task: reviewTaskInput(input.task),
       diagnosis: input.diagnosis,
       diffHash: input.diff.diffHash,
+      review: focusedReview,
+      evidence: input.evidence.map(semanticEvidenceInput),
+      priorFailure: latestFailureObservation(priorCorrections),
+      selectedSkills: selectedSkills.map(
+        ({ name, source, sha256: skillSha256, instructionsSha256 }) => ({
+          name,
+          source,
+          sha256: skillSha256,
+          instructionsSha256,
+        }),
+      ),
+      instructions: phaseProject.instructionFiles.map(({ relativePath, sha256 }) => ({
+        relativePath,
+        sha256,
+      })),
     });
+    assertRetryHasNewEvidence(priorCorrections, inputFingerprint, "Review correction");
     const contextPackPath = join(
       this.paths.taskDirectory(input.project.id, input.task.id),
       "context-packs",
@@ -767,6 +1106,8 @@ export class TaskReviewService implements TaskReviewer {
       taskId: input.task.id,
       phase: "correction",
       attemptNumber: input.cycle,
+      reservationId: setup.reservationId,
+      inputFingerprint,
       modelDecision: setup.modelDecision,
       sandboxMode: "workspace-write",
       contextPackPath,
@@ -775,7 +1116,13 @@ export class TaskReviewService implements TaskReviewer {
       status: "running",
       eventsPath,
     };
-    await this.executions.save(input.project.id, execution);
+    try {
+      await this.executions.save(input.project.id, execution);
+    } catch (error) {
+      await this.usage.releaseReservation(input.project.id, input.task.id, setup.reservationId);
+      throw error;
+    }
+    let callStarted = false;
     try {
       const prompt = await this.promptLoader.render("review-correction.prompt.md", {
         TASK_ID: input.task.id,
@@ -783,6 +1130,9 @@ export class TaskReviewService implements TaskReviewer {
         DIFF_HASH: input.diff.diffHash,
         CONTEXT_PACK: stableJson(pack),
       });
+      execution = { ...execution, callStartedAt: isoNow(this.clock) };
+      await this.executions.save(input.project.id, execution);
+      callStarted = true;
       const result = await this.runtime.runStructured({
         role: "corrector",
         prompt,
@@ -796,10 +1146,15 @@ export class TaskReviewService implements TaskReviewer {
         outputValidator: implementationResultSchema,
         timeoutMs: input.overrides.timeoutMs ?? input.config.runtime.defaultTimeoutSeconds * 1_000,
         eventsPath,
+        additionalAllowedEnvironmentNames: phaseProject.environmentPolicy.allowlist,
+        explicitSecretEnvironmentExceptions: phaseProject.environmentPolicy.secretExceptions,
+        ...(input.overrides.progress === undefined ? {} : { progress: input.overrides.progress }),
         ...(input.overrides.abortSignal === undefined
           ? {}
           : { abortSignal: input.overrides.abortSignal }),
       });
+      input.gitCorrelation.threadId = result.threadId;
+      assertStructuredOutputBounded(result.output, input.config);
       const implementation = implementationResultSchema.parse(result.output);
       if (implementation.taskId !== input.task.id) {
         throw new OrchestratorError("Review correction task identity mismatch", {
@@ -811,7 +1166,62 @@ export class TaskReviewService implements TaskReviewer {
         "runs",
         `${executionId}.review-correction.json`,
       );
+      const runtimeCompletedAt = isoNow(this.clock);
+      await this.store.write(
+        join(
+          this.paths.taskDirectory(input.project.id, input.task.id),
+          "runs",
+          `${executionId}.writer-runtime-checkpoint.json`,
+        ),
+        writerRuntimeCheckpointSchema.parse({
+          schemaVersion: 1,
+          executionId,
+          taskId: input.task.id,
+          sourceCommit: input.diagnosis.sourceCommit,
+          baseCommit: input.diff.baseCommit,
+          kind: "review-correction",
+          inputFingerprint,
+          modelDecision: setup.modelDecision,
+          implementation,
+          usage: result.usage,
+          threadId: result.threadId,
+          runtimeAttempts: result.runtimeAttempts,
+          resultArtifactPath,
+          completedAt: runtimeCompletedAt,
+        }),
+      );
       await this.store.write(resultArtifactPath, implementation);
+      const diff = await input.diffService.capture({
+        projectId: input.project.id,
+        taskId: input.task.id,
+        worktreePath: input.worktreePath,
+        sourceCommit: input.diagnosis.sourceCommit,
+        baseCommit: input.diff.baseCommit,
+      });
+      await this.store.write(
+        join(
+          this.paths.taskDirectory(input.project.id, input.task.id),
+          "runs",
+          `${executionId}.review-correction-checkpoint.json`,
+        ),
+        reviewCorrectionCheckpointSchema.parse({
+          schemaVersion: 1,
+          executionId,
+          taskId: input.task.id,
+          sourceCommit: input.diagnosis.sourceCommit,
+          baseCommit: input.diff.baseCommit,
+          preCorrectionDiffHash: input.diff.diffHash,
+          postCorrectionDiffHash: diff.diffHash,
+          inputFingerprint,
+          modelDecision: setup.modelDecision,
+          implementation,
+          usage: result.usage,
+          threadId: result.threadId,
+          runtimeAttempts: result.runtimeAttempts,
+          resultArtifactPath,
+          completedAt: isoNow(this.clock),
+        }),
+      );
       await this.usage.commitReservation({
         projectId: input.project.id,
         taskId: input.task.id,
@@ -822,13 +1232,6 @@ export class TaskReviewService implements TaskReviewer {
         agentCalls: result.runtimeAttempts,
         threadId: result.threadId,
       });
-      const diff = await input.diffService.capture({
-        projectId: input.project.id,
-        taskId: input.task.id,
-        worktreePath: input.worktreePath,
-        sourceCommit: input.diagnosis.sourceCommit,
-        baseCommit: input.diff.baseCommit,
-      });
       return {
         execution,
         threadId: result.threadId,
@@ -837,9 +1240,17 @@ export class TaskReviewService implements TaskReviewer {
         resultArtifactPath,
       };
     } catch (error) {
-      await this.usage
-        .releaseReservation(input.project.id, input.task.id, setup.reservationId)
-        .catch(() => undefined);
+      await (
+        !callStarted
+          ? this.usage.releaseReservation(input.project.id, input.task.id, setup.reservationId)
+          : this.usage.commitFailedReservation({
+              projectId: input.project.id,
+              taskId: input.task.id,
+              reservationId: setup.reservationId,
+              model: setup.modelDecision.model,
+              reasoning: setup.modelDecision.reasoning,
+            })
+      ).catch(() => undefined);
       let normalized = toOrchestratorError(error);
       if (input.overrides.abortSignal?.aborted ?? false) {
         normalized = new OrchestratorError("Task review correction was cancelled", {
@@ -888,15 +1299,6 @@ export class TaskReviewService implements TaskReviewer {
       priorFailedAttempts: input.attemptNumber - 1,
       overrides: routingOverrides,
     });
-    const admission = await new ContextBudgetManager(input.config, this.usage).admitAndReserve({
-      projectId: input.project.id,
-      taskId: input.task.id,
-      phase: input.phase,
-      profile: input.profile,
-      estimatedInputTokens: input.estimatedInputTokens,
-      activeParallelReaders: 0,
-      projectedAgentCalls: 2,
-    });
     await this.decisions.append(input.project.id, input.task.id, {
       kind: "model-routing",
       summary: `${modelDecision.model} / ${modelDecision.reasoning} selected for ${input.phase}`,
@@ -909,7 +1311,24 @@ export class TaskReviewService implements TaskReviewer {
         details: { phase: input.phase },
       });
     }
+    const admission = await new ContextBudgetManager(input.config, this.usage).admitAndReserve({
+      projectId: input.project.id,
+      taskId: input.task.id,
+      phase: input.phase,
+      profile: input.profile,
+      estimatedInputTokens: input.estimatedInputTokens,
+      activeParallelReaders: 0,
+      projectedAgentCalls: 2,
+    });
     return { modelDecision, reservationId: admission.reservation.id };
+  }
+
+  private reviewCheckpointPath(projectId: string, taskId: string, executionId: string): string {
+    return join(
+      this.paths.taskDirectory(projectId, taskId),
+      "runs",
+      `${executionId}.review-result.json`,
+    );
   }
 
   private async validateReview(
@@ -919,6 +1338,7 @@ export class TaskReviewService implements TaskReviewer {
     evidence: readonly Evidence[],
     worktreePath: string,
     cycle: number,
+    config: AppConfig,
   ): Promise<{ review: ReviewResult; generatedEvidence: Evidence[] }> {
     if (
       input.taskId !== task.id ||
@@ -927,6 +1347,12 @@ export class TaskReviewService implements TaskReviewer {
     ) {
       throw new OrchestratorError("Reviewer result identity or diff hash mismatch", {
         code: "CONTEXT_INTEGRITY",
+      });
+    }
+    if (input.findings.length > config.context.maxReviewFindings) {
+      throw new OrchestratorError("Reviewer returned too many findings", {
+        code: "BUDGET",
+        resumable: true,
       });
     }
     const expectedCriteria = new Set(task.acceptanceCriteria.map((criterion) => criterion.id));
@@ -985,7 +1411,7 @@ export class TaskReviewService implements TaskReviewer {
         });
       }
       const evidenceId = `REV-${cycle}-${finding.id}-${sha256(`${diff.diffHash}:${finding.id}`).slice(0, 10)}`;
-      generatedEvidence.push({
+      const generated: Evidence = {
         id: evidenceId,
         taskId: task.id,
         kind: "review",
@@ -1001,7 +1427,18 @@ export class TaskReviewService implements TaskReviewer {
           .slice(0, 4_000),
         sha256: sha256(contents),
         observedAt: isoNow(this.clock),
-      });
+      };
+      const existingGenerated = evidence.find((item) => item.id === evidenceId);
+      if (existingGenerated === undefined) {
+        generatedEvidence.push(generated);
+      } else if (
+        stableJson({ ...existingGenerated, observedAt: undefined }) !==
+        stableJson({ ...generated, observedAt: undefined })
+      ) {
+        throw new OrchestratorError(`Review evidence identity collision: ${evidenceId}`, {
+          code: "CONTEXT_INTEGRITY",
+        });
+      }
       availableEvidence.add(evidenceId);
       findings.push({
         ...finding,
@@ -1019,6 +1456,12 @@ export class TaskReviewService implements TaskReviewer {
           { code: "CONTEXT_INTEGRITY" },
         );
       }
+    }
+    if (evidence.length + generatedEvidence.length > config.context.maxEvidenceItems) {
+      throw new OrchestratorError("Review evidence exceeds the configured task bound", {
+        code: "BUDGET",
+        resumable: true,
+      });
     }
     if (input.scopeAssessment.unexpectedFiles.some((path) => !diff.changedFiles.includes(path))) {
       throw new OrchestratorError("Scope assessment references files outside the captured diff", {
@@ -1065,9 +1508,12 @@ export class TaskReviewService implements TaskReviewer {
     });
   }
 
-  private scopedGit(task: Task): GitClient {
+  private scopedGit(
+    task: Task,
+    correlation: GitCommandCorrelation = { phase: "review" },
+  ): GitClient {
     return new GitClient({
-      observer: async (record) => this.gitLog.append(task.projectId, task.id, record),
+      observer: async (record) => this.gitLog.append(task.projectId, task.id, record, correlation),
     });
   }
 
@@ -1114,6 +1560,7 @@ async function assertReviewArtifacts(
   verification: VerificationResult,
   worktreePath: string,
   diagnosis: Diagnosis,
+  expectedPolicyHash: string,
 ): Promise<void> {
   await diffService.assertCurrent(diff, worktreePath);
   if (
@@ -1121,6 +1568,7 @@ async function assertReviewArtifacts(
     verification.taskId !== diagnosis.taskId ||
     verification.sourceCommit !== diagnosis.sourceCommit ||
     verification.diffHash !== diff.diffHash ||
+    verification.policyHash !== expectedPolicyHash ||
     verification.overallStatus !== "passed"
   ) {
     throw new OrchestratorError("Review requires passing verification for the exact current diff", {
@@ -1196,4 +1644,36 @@ function mergeEvidence(items: readonly Evidence[]): Evidence[] {
   const byId = new Map<string, Evidence>();
   for (const item of items) byId.set(item.id, item);
   return [...byId.values()].sort((left, right) => left.id.localeCompare(right.id));
+}
+
+function reviewTaskInput(task: Task): unknown {
+  return {
+    id: task.id,
+    projectId: task.projectId,
+    type: task.type,
+    title: task.title,
+    summary: task.summary,
+    reports: task.reports,
+    constraints: task.constraints,
+    acceptanceCriteria: task.acceptanceCriteria,
+    protectedContracts: task.protectedContracts,
+    assumptions: task.assumptions,
+    unknowns: task.unknowns,
+    requestedScope: task.requestedScope,
+    profile: task.profile,
+  };
+}
+
+function isMissingStateDocument(error: unknown): boolean {
+  return (
+    error instanceof OrchestratorError &&
+    error.code === "CONFIGURATION" &&
+    error.message.startsWith("Unable to read state document at ")
+  );
+}
+
+function withoutExecutionError(attempt: ExecutionAttempt): ExecutionAttempt {
+  const { error, ...withoutError } = attempt;
+  void error;
+  return withoutError;
 }

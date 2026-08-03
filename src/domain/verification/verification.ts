@@ -31,6 +31,7 @@ export const verificationResultSchema = z
     taskId: z.string().min(1),
     sourceCommit: z.string().regex(/^[a-f0-9]{40,64}$/u),
     diffHash: z.string().regex(/^[a-f0-9]{64}$/u),
+    policyHash: z.string().regex(/^[a-f0-9]{64}$/u),
     overallStatus: z.enum(["passed", "failed", "blocked"]),
     commands: z.array(verificationCommandResultSchema),
     startedAt: z.string().datetime(),

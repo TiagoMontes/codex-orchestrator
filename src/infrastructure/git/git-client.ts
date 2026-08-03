@@ -34,6 +34,18 @@ export type GitClientOptions = {
 export class GitClient {
   constructor(private readonly options: GitClientOptions = {}) {}
 
+  gitVersion(): Promise<string> {
+    return this.run(process.cwd(), ["--version"]);
+  }
+
+  async initializeEmptyRepository(path: string): Promise<void> {
+    await this.run(path, ["init", "--quiet", "--initial-branch=cxo-normalization"]);
+  }
+
+  listWorktreesPorcelain(path: string): Promise<string> {
+    return this.run(path, ["worktree", "list", "--porcelain"]);
+  }
+
   async inspectRepository(inputPath: string): Promise<GitRepositoryMetadata> {
     const canonicalInput = await canonicalizeExistingPath(inputPath);
     const rootResult = await this.run(canonicalInput, ["rev-parse", "--show-toplevel"]);
@@ -129,6 +141,44 @@ export class GitClient {
     return this.run(gitRoot, ["show", `${resolved}:${path}`]);
   }
 
+  async showFileBufferAtCommit(gitRoot: string, commit: string, path: string): Promise<Buffer> {
+    assertSafeGitPath(path);
+    const resolved = await this.resolveCommit(gitRoot, commit);
+    const startedAt = new Date().toISOString();
+    const argv = ["git", "-C", gitRoot, "show", `${resolved}:${path}`];
+    const result = await execa("git", argv.slice(1), {
+      reject: false,
+      timeout: 15_000,
+      maxBuffer: 8_000_000,
+      encoding: "buffer",
+    }).catch(async (error: unknown) => {
+      await this.options.observer?.({
+        cwd: gitRoot,
+        argv,
+        startedAt,
+        completedAt: new Date().toISOString(),
+        exitCode: null,
+        stderrExcerpt: error instanceof Error ? error.message.slice(-2_000) : "Git spawn failed",
+      });
+      throw error;
+    });
+    await this.options.observer?.({
+      cwd: gitRoot,
+      argv,
+      startedAt,
+      completedAt: new Date().toISOString(),
+      exitCode: result.exitCode ?? null,
+      stderrExcerpt: Buffer.from(result.stderr).toString("utf8").slice(-2_000),
+    });
+    if (result.exitCode !== 0) {
+      throw new OrchestratorError(`Git command failed: git show ${resolved}:${path}`, {
+        code: "PROJECT",
+        cause: new Error(Buffer.from(result.stderr).toString("utf8").trim()),
+      });
+    }
+    return Buffer.from(result.stdout);
+  }
+
   async changedFilesBetween(
     gitRoot: string,
     fromCommit: string,
@@ -189,6 +239,15 @@ export class GitClient {
       worktreePath,
       baseCommit,
     ]);
+  }
+
+  async createDetachedWorktree(
+    gitRoot: string,
+    worktreePath: string,
+    baseCommit: string,
+  ): Promise<void> {
+    const resolved = await this.resolveCommit(gitRoot, baseCommit);
+    await this.run(gitRoot, ["worktree", "add", "--detach", worktreePath, resolved]);
   }
 
   async removeWorktree(gitRoot: string, worktreePath: string, force = false): Promise<void> {
@@ -313,15 +372,26 @@ export class GitClient {
 
   private async execute(gitRoot: string, argv: string[]) {
     const startedAt = new Date().toISOString();
-    const result = await execa("git", ["-C", gitRoot, ...argv], {
+    const fullArgv = ["git", "-C", gitRoot, ...argv];
+    const result = await execa("git", fullArgv.slice(1), {
       reject: false,
       timeout: 15_000,
       maxBuffer: 8_000_000,
       stripFinalNewline: false,
+    }).catch(async (error: unknown) => {
+      await this.options.observer?.({
+        cwd: gitRoot,
+        argv: fullArgv,
+        startedAt,
+        completedAt: new Date().toISOString(),
+        exitCode: null,
+        stderrExcerpt: error instanceof Error ? error.message.slice(-2_000) : "Git spawn failed",
+      });
+      throw error;
     });
     await this.options.observer?.({
       cwd: gitRoot,
-      argv: ["git", "-C", gitRoot, ...argv],
+      argv: fullArgv,
       startedAt,
       completedAt: new Date().toISOString(),
       exitCode: result.exitCode ?? null,

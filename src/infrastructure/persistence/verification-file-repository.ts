@@ -25,4 +25,15 @@ export class VerificationFileRepository {
       verificationResultSchema,
     );
   }
+
+  readForExecution(
+    projectId: string,
+    taskId: string,
+    executionId: string,
+  ): Promise<VerificationResult> {
+    return this.store.read(
+      join(this.paths.taskDirectory(projectId, taskId), "runs", `${executionId}.verification.json`),
+      verificationResultSchema,
+    );
+  }
 }

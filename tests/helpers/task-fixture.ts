@@ -12,6 +12,7 @@ export const routingTestTask: Task = {
   title: "Bug",
   summary: "Bug",
   originalFeedbackPath: "/tmp/original.md",
+  originalFeedbackSha256: "a".repeat(64),
   profile: "balanced",
   risk: "medium",
   riskSignals: [],

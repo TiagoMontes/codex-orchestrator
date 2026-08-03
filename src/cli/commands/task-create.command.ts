@@ -5,7 +5,7 @@ import type { ConfigService } from "../../application/configuration/config-servi
 import type { TaskManager } from "../../application/tasks/task-service.js";
 import { OrchestratorError } from "../../shared/errors.js";
 import type { OutputWriter } from "../output.js";
-import { writeResult } from "../output.js";
+import { codexProgressWriter, writeResult } from "../output.js";
 import { parseCliValue } from "../validation.js";
 
 export function registerTaskCreateCommand(
@@ -39,8 +39,15 @@ export function registerTaskCreateCommand(
           options.from === undefined
             ? await readStandardInput()
             : await readFile(options.from, "utf8");
-        const result = await tasks.create({ project: options.project, feedback, profile });
-        if (isJson(program)) {
+        const json = isJson(program);
+        if (!json) output.write("[normalization] starting");
+        const result = await tasks.create({
+          project: options.project,
+          feedback,
+          profile,
+          ...(json ? {} : { progress: codexProgressWriter(output) }),
+        });
+        if (json) {
           writeResult(output, result, true);
           return;
         }

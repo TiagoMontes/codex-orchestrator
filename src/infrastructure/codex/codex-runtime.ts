@@ -12,6 +12,27 @@ export type AgentRole =
   | "corrector"
   | "read-worker";
 
+export type CodexProgressEvent =
+  | { role: AgentRole; kind: "thread-started" }
+  | {
+      role: AgentRole;
+      kind: "command-completed";
+      status: string;
+      exitCode?: number;
+    }
+  | {
+      role: AgentRole;
+      kind: "tool-completed";
+      server: string;
+      tool: string;
+      status: string;
+    }
+  | { role: AgentRole; kind: "turn-completed"; usage: NormalizedUsage }
+  | { role: AgentRole; kind: "turn-failed" | "runtime-timeout" | "runtime-cancelled" }
+  | { role: AgentRole; kind: "output-repair" | "reasoning-fallback" };
+
+export type CodexProgressObserver = (event: CodexProgressEvent) => void;
+
 export type CodexRunRequest<T> = {
   role: AgentRole;
   prompt: string;
@@ -25,6 +46,9 @@ export type CodexRunRequest<T> = {
   outputValidator: ZodType<T>;
   timeoutMs: number;
   eventsPath: string;
+  additionalAllowedEnvironmentNames?: readonly string[];
+  explicitSecretEnvironmentExceptions?: readonly string[];
+  progress?: CodexProgressObserver;
   abortSignal?: AbortSignal;
   resumeThreadId?: string;
 };

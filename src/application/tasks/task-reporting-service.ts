@@ -11,6 +11,7 @@ import type { UsageLedgerDocument } from "../../domain/usage/usage-ledger.js";
 import type { VerificationResult } from "../../domain/verification/verification.js";
 import { resolveSafePath } from "../../infrastructure/filesystem/path-safety.js";
 import { DiffService } from "../../infrastructure/git/diff-service.js";
+import { GitClientFactory } from "../../infrastructure/git/git-client-factory.js";
 import type {
   DecisionEntry,
   DecisionFileRepository,
@@ -24,6 +25,9 @@ import type { UsageFileRepository } from "../../infrastructure/persistence/usage
 import type { VerificationFileRepository } from "../../infrastructure/persistence/verification-file-repository.js";
 import { OrchestratorError } from "../../shared/errors.js";
 import { sha256 } from "../../shared/hashing.js";
+import type { ProjectManager } from "../projects/project-service.js";
+import { verificationPolicyHash } from "./verification-policy.js";
+import { contextPackSchema, type ContextPack } from "../../orchestration/context/context-pack.js";
 
 const ANSI_SEQUENCE = new RegExp(`${String.fromCharCode(27)}\\[[0-?]*[ -/]*[@-~]`, "gu");
 
@@ -41,6 +45,19 @@ export type TaskStatusReport = {
   }>;
   threads: string[];
   retryCount: number;
+  retries: Array<{
+    executionId: string;
+    phase: ExecutionPhase;
+    attemptNumber: number;
+    reason: string;
+  }>;
+  contextRotations: Array<{
+    executionId: string;
+    phase: ExecutionPhase;
+    threadId?: string;
+    compacted: boolean;
+    reasons: string[];
+  }>;
   artifacts: {
     diagnosis?: Diagnosis;
     diff?: DiffArtifact;
@@ -85,6 +102,8 @@ export interface TaskReporter {
 }
 
 export class TaskReportingService implements TaskReporter {
+  private readonly gitClients: GitClientFactory;
+
   constructor(
     private readonly paths: StatePaths,
     private readonly tasks: TaskFileRepository,
@@ -94,11 +113,13 @@ export class TaskReportingService implements TaskReporter {
     private readonly verificationRepository: VerificationFileRepository,
     private readonly reviews: ReviewFileRepository,
     private readonly decisions: DecisionFileRepository,
-  ) {}
+    private readonly projects: ProjectManager,
+  ) {
+    this.gitClients = new GitClientFactory(paths);
+  }
 
   async status(taskId: string): Promise<TaskStatusReport> {
-    const task = await this.tasks.get(taskId);
-    const state = await this.tasks.getState(taskId);
+    const { task, state } = await this.tasks.getSnapshot(taskId);
     if (task.status !== state.status) {
       throw new OrchestratorError("Task and state documents disagree", {
         code: "CONTEXT_INTEGRITY",
@@ -112,7 +133,11 @@ export class TaskReportingService implements TaskReporter {
       ),
       this.readOptional(
         join(this.paths.taskDirectory(task.projectId, task.id), "diff.json"),
-        async () => new DiffService(this.paths).read(task.projectId, task.id),
+        async () =>
+          new DiffService(
+            this.paths,
+            this.gitClients.task(task.projectId, task.id, { phase: "reporting" }),
+          ).read(task.projectId, task.id),
       ),
       this.readOptional(
         join(this.paths.taskDirectory(task.projectId, task.id), "verification.json"),
@@ -128,12 +153,40 @@ export class TaskReportingService implements TaskReporter {
     const liveDiffCurrent =
       diff === undefined || task.worktree === undefined
         ? undefined
-        : await new DiffService(this.paths)
+        : await new DiffService(
+            this.paths,
+            this.gitClients.task(task.projectId, task.id, { phase: "reporting" }),
+          )
             .assertCurrent(diff, task.worktree.path)
             .then(() => true)
             .catch(() => false);
     const latestAttempt = attempts.at(-1);
     const suggestedNextCommand = nextCommand(state);
+    const contextPacks = await this.readContextPacks(task, attempts);
+    const retries = attempts
+      .filter((attempt) => attempt.phase !== "exploration" && attempt.attemptNumber > 1)
+      .map((attempt) => ({
+        executionId: attempt.id,
+        phase: attempt.phase,
+        attemptNumber: attempt.attemptNumber,
+        reason:
+          contextPacks.get(attempt.id)?.latestFailure ??
+          attempt.error?.message ??
+          "Retry admitted after a changed evidence fingerprint",
+      }));
+    const contextRotations = attempts.flatMap((attempt) => {
+      const pack = contextPacks.get(attempt.id);
+      if (pack === undefined || !pack.contextPolicy.threadRotated) return [];
+      return [
+        {
+          executionId: attempt.id,
+          phase: attempt.phase,
+          ...(attempt.threadId === undefined ? {} : { threadId: attempt.threadId }),
+          compacted: pack.contextPolicy.compacted,
+          reasons: pack.contextPolicy.reasons,
+        },
+      ];
+    });
     return {
       task,
       state,
@@ -147,9 +200,9 @@ export class TaskReportingService implements TaskReporter {
           ...attempts.flatMap((attempt) => attempt.threadId ?? []),
         ]),
       ],
-      retryCount: attempts.filter(
-        (attempt) => attempt.phase !== "exploration" && attempt.attemptNumber > 1,
-      ).length,
+      retryCount: retries.length,
+      retries,
+      contextRotations,
       artifacts: {
         ...(diagnosis === undefined ? {} : { diagnosis }),
         ...(diff === undefined ? {} : { diff }),
@@ -157,13 +210,13 @@ export class TaskReportingService implements TaskReporter {
         ...(review === undefined ? {} : { review }),
       },
       decisions,
-      limitations: [
-        "No merge or push is performed automatically.",
-        "Verification process network isolation depends on the host OS; only approved argv are run.",
-        ...(liveDiffCurrent === false
-          ? ["The live worktree no longer matches the latest persisted diff."]
-          : []),
-      ],
+      limitations: knownLimitations({
+        ...(diagnosis === undefined ? {} : { diagnosis }),
+        ...(verification === undefined ? {} : { verification }),
+        ...(review === undefined ? {} : { review }),
+        state,
+        ...(liveDiffCurrent === undefined ? {} : { liveDiffCurrent }),
+      }),
       integrity: {
         artifactRelationshipsValid: true,
         ...(liveDiffCurrent === undefined ? {} : { liveDiffCurrent }),
@@ -177,7 +230,11 @@ export class TaskReportingService implements TaskReporter {
     options: { stat?: boolean; patch?: boolean } = {},
   ): Promise<TaskDiffReport> {
     const task = await this.tasks.get(taskId);
-    const artifact = await new DiffService(this.paths).read(task.projectId, task.id);
+    const diffService = new DiffService(
+      this.paths,
+      this.gitClients.task(task.projectId, task.id, { phase: "reporting" }),
+    );
+    const artifact = await diffService.read(task.projectId, task.id);
     if (
       artifact.taskId !== task.id ||
       task.baseCommit === undefined ||
@@ -189,24 +246,22 @@ export class TaskReportingService implements TaskReporter {
       });
     }
     const taskDirectory = this.paths.taskDirectory(task.projectId, task.id);
-    const patch = await new DiffService(this.paths).readPersistedPatch(
-      artifact,
-      task.projectId,
-      task.id,
-    );
+    const patch = await diffService.readPersistedPatch(artifact, task.projectId, task.id);
     const live = task.worktree !== undefined && (await exists(task.worktree.path));
     if (live && task.worktree !== undefined) {
-      await new DiffService(this.paths).assertCurrent(artifact, task.worktree.path);
+      await diffService.assertCurrent(artifact, task.worktree.path);
     }
     const verification = await this.readOptional(
       join(taskDirectory, "verification.json"),
       async () => this.verificationRepository.read(task.projectId, task.id),
     );
+    const project = await this.projects.inspect(task.projectId);
     const verified =
       verification?.overallStatus === "passed" &&
       verification.taskId === task.id &&
       verification.sourceCommit === artifact.sourceCommit &&
-      verification.diffHash === artifact.diffHash;
+      verification.diffHash === artifact.diffHash &&
+      verification.policyHash === verificationPolicyHash(project);
     return {
       taskId,
       diff: artifact,
@@ -284,6 +339,25 @@ export class TaskReportingService implements TaskReporter {
   private async readOptional<T>(path: string, read: () => Promise<T>): Promise<T | undefined> {
     return (await exists(path)) ? read() : undefined;
   }
+
+  private async readContextPacks(
+    task: Task,
+    attempts: readonly ExecutionAttempt[],
+  ): Promise<Map<string, ContextPack>> {
+    const taskDirectory = this.paths.taskDirectory(task.projectId, task.id);
+    const pairs = await Promise.all(
+      attempts.map(async (attempt) => {
+        try {
+          const path = await resolveSafePath(taskDirectory, attempt.contextPackPath);
+          const pack = contextPackSchema.parse(JSON.parse(await readFile(path, "utf8")) as unknown);
+          return [attempt.id, pack] as const;
+        } catch {
+          return undefined;
+        }
+      }),
+    );
+    return new Map(pairs.filter((pair): pair is NonNullable<typeof pair> => pair !== undefined));
+  }
 }
 
 function assertArtifactRelationships(
@@ -350,6 +424,59 @@ function usageBreakdown(ledger: UsageLedgerDocument): TaskStatusReport["usageBre
   return [...totals.values()].sort((left, right) =>
     `${left.phase}:${left.model}`.localeCompare(`${right.phase}:${right.model}`),
   );
+}
+
+function knownLimitations(input: {
+  diagnosis?: Diagnosis;
+  verification?: VerificationResult;
+  review?: ReviewResult;
+  state: TaskStateDocument;
+  liveDiffCurrent?: boolean;
+}): string[] {
+  const limitations = new Set<string>([
+    "No merge or push is performed automatically.",
+    "Only explicitly approved verification argv run, and a missing host sandbox blocks execution.",
+  ]);
+  if (input.diagnosis !== undefined) {
+    for (const blocker of input.diagnosis.reproduction.blockers) {
+      limitations.add(`Diagnosis reproduction blocker: ${blocker}`);
+    }
+    for (const hypothesis of input.diagnosis.activeHypotheses) {
+      limitations.add(`Unresolved diagnosis hypothesis: ${hypothesis.statement}`);
+    }
+    if (input.diagnosis.status !== "confirmed") {
+      limitations.add(`Diagnosis remains ${input.diagnosis.status}: ${input.diagnosis.nextAction}`);
+    }
+  }
+  if (input.verification !== undefined && input.verification.overallStatus !== "passed") {
+    limitations.add(`Deterministic verification is ${input.verification.overallStatus}.`);
+    for (const command of input.verification.commands.filter((item) => item.status !== "passed")) {
+      limitations.add(`Verification ${command.name} is ${command.status}.`);
+    }
+  }
+  if (input.review !== undefined && input.review.verdict !== "approve") {
+    limitations.add(`Independent review verdict is ${input.review.verdict}.`);
+    for (const finding of input.review.findings) {
+      limitations.add(`Review finding [${finding.severity}]: ${finding.title}`);
+    }
+    for (const assessment of input.review.acceptanceCriteriaAssessment.filter(
+      (item) => item.status !== "met",
+    )) {
+      limitations.add(
+        `Acceptance criterion ${assessment.criterionId} is ${assessment.status}: ${assessment.explanation}`,
+      );
+    }
+  }
+  if (input.state.status === "blocked" || input.state.status === "cancelled") {
+    const latest = input.state.transitions.at(-1);
+    limitations.add(
+      `Task is ${input.state.status}${latest === undefined ? "." : `: ${latest.reason}`}`,
+    );
+  }
+  if (input.liveDiffCurrent === false) {
+    limitations.add("The live worktree no longer matches the latest persisted diff.");
+  }
+  return [...limitations];
 }
 
 function nextCommand(state: TaskStateDocument): string | undefined {

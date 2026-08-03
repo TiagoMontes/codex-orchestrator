@@ -19,6 +19,7 @@ import { isoNow, systemClock } from "../../shared/clock.js";
 import { OrchestratorError } from "../../shared/errors.js";
 import { sha256, stableJson } from "../../shared/hashing.js";
 import { failureSignature } from "../../orchestration/engine/failure-signature.js";
+import { approvedVerificationCommands, verificationPolicyHash } from "./verification-policy.js";
 
 export type VerificationRunReport = {
   result: VerificationResult;
@@ -50,13 +51,15 @@ export class VerificationService {
     abortSignal?: AbortSignal;
   }): Promise<VerificationRunReport> {
     const startedAt = isoNow(this.clock);
-    const approved = approvedCommands(input.project);
+    const approved = approvedVerificationCommands(input.project);
+    const policyHash = verificationPolicyHash(input.project);
     if (approved.length === 0) {
       const result = verificationResultSchema.parse({
         schemaVersion: 1,
         taskId: input.task.id,
         sourceCommit: input.diff.sourceCommit,
         diffHash: input.diff.diffHash,
+        policyHash,
         overallStatus: "blocked",
         commands: [],
         startedAt,
@@ -81,11 +84,13 @@ export class VerificationService {
         cwd: input.worktreePath,
         timeoutMs: command.timeoutSeconds * 1_000,
         logPath,
+        additionalAllowedEnvironmentNames: input.project.environmentPolicy.allowlist,
+        explicitSecretEnvironmentExceptions: input.project.environmentPolicy.secretExceptions,
         ...(input.abortSignal === undefined ? {} : { abortSignal: input.abortSignal }),
       });
       cancelled ||= raw.aborted;
       let status: VerificationCommandResult["status"] =
-        raw.spawnError !== undefined || raw.aborted
+        raw.spawnError !== undefined || raw.sandboxError !== undefined || raw.aborted
           ? "blocked"
           : raw.exitCode === 0 && !raw.timedOut
             ? "passed"
@@ -139,6 +144,7 @@ export class VerificationService {
       taskId: input.task.id,
       sourceCommit: input.diff.sourceCommit,
       diffHash: input.diff.diffHash,
+      policyHash,
       overallStatus,
       commands: commandResults,
       startedAt,
@@ -152,7 +158,7 @@ export class VerificationService {
         resumable: true,
       });
     }
-    if (overallStatus === "passed" || overallStatus === "blocked") {
+    if (overallStatus === "passed") {
       return { result, evidence };
     }
     return {
@@ -167,18 +173,6 @@ export class VerificationService {
       }),
     };
   }
-}
-
-function approvedCommands(project: Project): VerificationCommand[] {
-  const commands = [...project.verificationPolicy.focused, ...project.verificationPolicy.full];
-  const seen = new Set<string>();
-  return commands.filter((command) => {
-    if (!command.approved) return false;
-    const key = stableJson(command.argv);
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
 }
 
 function verificationEvidenceId(

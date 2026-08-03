@@ -1,12 +1,17 @@
 import { z } from "zod";
-import { acceptanceCriterionSchema } from "../../domain/task/task.js";
+import {
+  acceptanceCriterionSchema,
+  assumptionSchema,
+  issueReportSchema,
+  scopeDefinitionSchema,
+} from "../../domain/task/task.js";
 import { evidenceSchema } from "../../domain/evidence/evidence.js";
 import { executionPhaseSchema } from "../../domain/execution/execution.js";
 
 export const contextPackSchema = z
   .object({
     schemaVersion: z.literal(1),
-    contextPackVersion: z.literal(1),
+    contextPackVersion: z.literal(2),
     phase: executionPhaseSchema,
     objective: z.string().min(1),
     task: z
@@ -15,6 +20,16 @@ export const contextPackSchema = z
         schemaVersion: z.number().int().positive(),
         revision: z.number().int().positive(),
         hash: z.string(),
+      })
+      .strict(),
+    taskBrief: z
+      .object({
+        title: z.string().min(1),
+        summary: z.string().min(1),
+        reports: z.array(issueReportSchema).min(1),
+        assumptions: z.array(assumptionSchema),
+        unknowns: z.array(z.string()),
+        requestedScope: scopeDefinitionSchema,
       })
       .strict(),
     projectId: z.string(),
@@ -61,6 +76,13 @@ export const contextPackSchema = z
     relevantFiles: z.array(z.string()),
     latestFailure: z.string().nullable(),
     expectedOutputSchema: z.record(z.string(), z.unknown()),
+    contextPolicy: z
+      .object({
+        compacted: z.boolean(),
+        threadRotated: z.literal(true),
+        reasons: z.array(z.string().min(1)).min(1),
+      })
+      .strict(),
     estimatedInputTokens: z.number().int().nonnegative(),
     estimateSource: z.literal("estimated"),
   })

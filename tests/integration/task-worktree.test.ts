@@ -13,6 +13,7 @@ import { StatePaths } from "../../src/infrastructure/persistence/state-paths.js"
 import { TaskFileRepository } from "../../src/infrastructure/persistence/task-file-repository.js";
 import { DiffService } from "../../src/infrastructure/git/diff-service.js";
 import { TaskStateMachine } from "../../src/orchestration/engine/state-machine.js";
+import type { Task } from "../../src/domain/task/task.js";
 import { createGitFixture, gitOutput } from "../helpers/git-fixture.js";
 
 const temporaryDirectories: string[] = [];
@@ -63,23 +64,27 @@ describe("task worktrees", () => {
       reason: "fixture diagnosis started",
       actor: "system",
     });
+    let diagnosedTask: Task = {
+      ...created.task,
+      status: "diagnosing",
+      baseRef: project.baseRef,
+      baseCommit: sourceCommit,
+      revision: created.task.revision + 1,
+      updatedAt: timestamp,
+    };
+    await taskRepository.update(diagnosedTask, state);
     state = stateMachine.transition(state, {
       nextState: "diagnosed",
       timestamp,
       reason: "fixture diagnosis complete",
       actor: "agent",
     });
-    await taskRepository.update(
-      {
-        ...created.task,
-        status: "diagnosed",
-        baseRef: project.baseRef,
-        baseCommit: sourceCommit,
-        revision: created.task.revision + 1,
-        updatedAt: timestamp,
-      },
-      state,
-    );
+    diagnosedTask = {
+      ...diagnosedTask,
+      status: "diagnosed",
+      revision: diagnosedTask.revision + 1,
+    };
+    await taskRepository.update(diagnosedTask, state);
     await diagnosisRepository.save(project.id, {
       schemaVersion: 1,
       taskId: created.task.id,

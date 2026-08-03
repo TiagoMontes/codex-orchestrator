@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -98,9 +98,70 @@ describe("task creation", () => {
     });
     expect(status.state.status).toBe("ready-for-diagnosis");
     expect(status.state.transitions).toHaveLength(2);
+    const invalidTimestamp = "2026-08-02T12:01:00.000Z";
+    await expect(
+      repository.update({
+        ...reloaded,
+        status: "diagnosing",
+        revision: reloaded.revision + 1,
+        updatedAt: invalidTimestamp,
+      }),
+    ).rejects.toThrow("atomic state transition");
+    await expect(
+      repository.update(
+        {
+          ...reloaded,
+          status: "diagnosing",
+          revision: reloaded.revision + 1,
+          updatedAt: invalidTimestamp,
+        },
+        {
+          ...status.state,
+          status: "diagnosing",
+          transitions: [
+            {
+              previousState: "ready-for-diagnosis",
+              nextState: "diagnosing",
+              timestamp: invalidTimestamp,
+              reason: "malformed truncated history",
+              actor: "system",
+            },
+          ],
+          updatedAt: invalidTimestamp,
+        },
+      ),
+    ).rejects.toThrow("exact extension");
     await expect(
       repository.preserveOriginalFeedback("demo", result.task.id, "replacement"),
     ).rejects.toThrow("immutable");
+    await writeFile(
+      join(paths.taskDirectory("demo", result.task.id), "transition-journal.json"),
+      `${JSON.stringify({
+        schemaVersion: 1,
+        task: {
+          ...reloaded,
+          status: "diagnosing",
+          revision: reloaded.revision + 1,
+          updatedAt: invalidTimestamp,
+        },
+        state: {
+          ...status.state,
+          status: "diagnosing",
+          transitions: [
+            {
+              previousState: "ready-for-diagnosis",
+              nextState: "diagnosing",
+              timestamp: invalidTimestamp,
+              reason: "malformed recovery history",
+              actor: "system",
+            },
+          ],
+          updatedAt: invalidTimestamp,
+        },
+      })}\n`,
+      "utf8",
+    );
+    await expect(repository.get(result.task.id)).rejects.toThrow("exact extension");
   });
 
   it("persists, cancels, and genuinely resumes an interrupted normalization", async () => {

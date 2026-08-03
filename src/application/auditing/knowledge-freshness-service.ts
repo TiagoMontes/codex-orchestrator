@@ -12,6 +12,7 @@ export class KnowledgeFreshnessService {
   assess(input: {
     generation: KnowledgeGeneration;
     currentHeadCommit: string;
+    verificationPolicyHash?: string;
     instructionHashes: Array<{ path: string; sha256: string }>;
     selectedSkills: Array<{
       name: string;
@@ -28,7 +29,10 @@ export class KnowledgeFreshnessService {
     const skillsChanged =
       JSON.stringify(normalizeSkills(input.generation.manifest.selectedSkills)) !==
       JSON.stringify(normalizeSkills(input.selectedSkills));
-    if (!instructionsChanged && !skillsChanged && !headChanged) {
+    const verificationPolicyChanged =
+      input.verificationPolicyHash !== undefined &&
+      input.generation.manifest.verificationPolicyHash !== input.verificationPolicyHash;
+    if (!instructionsChanged && !skillsChanged && !verificationPolicyChanged && !headChanged) {
       return { stale: false, usable: true };
     }
     if (instructionsChanged) {
@@ -43,6 +47,13 @@ export class KnowledgeFreshnessService {
         stale: true,
         usable: false,
         reason: "Selected workflow skills changed after the audit",
+      };
+    }
+    if (verificationPolicyChanged) {
+      return {
+        stale: true,
+        usable: false,
+        reason: "Project verification policy changed after the audit",
       };
     }
     const evidenceFiles = new Set(

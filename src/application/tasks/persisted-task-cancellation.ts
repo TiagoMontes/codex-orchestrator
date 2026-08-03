@@ -5,6 +5,8 @@ export class PersistedTaskCancellation {
   private readonly controller = new AbortController();
   private readonly timer: NodeJS.Timeout;
   private readonly forwardAbort: () => void;
+  private pollInFlight: Promise<void> | undefined;
+  private disposed = false;
 
   constructor(
     private readonly tasks: TaskFileRepository,
@@ -16,18 +18,28 @@ export class PersistedTaskCancellation {
       this.controller.abort(callerSignal?.reason ?? new Error("Caller cancelled the task"));
     callerSignal?.addEventListener("abort", this.forwardAbort, { once: true });
     if (callerSignal?.aborted ?? false) this.forwardAbort();
-    this.timer = setInterval(() => void this.poll(), pollIntervalMs);
+    this.timer = setInterval(() => this.schedulePoll(), pollIntervalMs);
     this.timer.unref();
-    void this.poll();
+    this.schedulePoll();
   }
 
   get signal(): AbortSignal {
     return this.controller.signal;
   }
 
-  dispose(callerSignal?: AbortSignal): void {
+  async dispose(callerSignal?: AbortSignal): Promise<void> {
+    this.disposed = true;
     clearInterval(this.timer);
     callerSignal?.removeEventListener("abort", this.forwardAbort);
+    await this.pollInFlight;
+  }
+
+  private schedulePoll(): void {
+    if (this.disposed || this.pollInFlight !== undefined) return;
+    const poll = this.poll().finally(() => {
+      if (this.pollInFlight === poll) this.pollInFlight = undefined;
+    });
+    this.pollInFlight = poll;
   }
 
   private async poll(): Promise<void> {

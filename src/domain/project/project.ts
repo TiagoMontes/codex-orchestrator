@@ -12,9 +12,9 @@ export const verificationCommandSchema = z
 
 export const verificationPolicySchema = z
   .object({
-    focused: z.array(verificationCommandSchema),
-    full: z.array(verificationCommandSchema),
-    candidates: z.array(verificationCommandSchema),
+    focused: z.array(verificationCommandSchema).max(64),
+    full: z.array(verificationCommandSchema).max(64),
+    candidates: z.array(verificationCommandSchema).max(64),
   })
   .strict();
 
@@ -36,6 +36,22 @@ const projectVerificationCommandConfigSchema = z
         path: ["command"],
       });
     }
+    const argv = value.command ?? value.argv ?? [];
+    if (argv.some((argument) => /[\0\r\n]/u.test(argument))) {
+      context.addIssue({
+        code: "custom",
+        message: "Command arguments cannot contain NUL or line breaks",
+        path: ["command"],
+      });
+    }
+    if (containsSensitiveCommandArgument(argv)) {
+      context.addIssue({
+        code: "custom",
+        message:
+          "Command arguments cannot contain credential-like values; use named environment configuration",
+        path: ["command"],
+      });
+    }
   })
   .transform(({ command, argv, ...value }) => ({
     ...value,
@@ -46,11 +62,44 @@ export const projectConfigSchema = z
   .object({
     schemaVersion: z.literal(1),
     projectId: z.string().min(1),
+    environment: z
+      .object({
+        allowlist: z
+          .array(z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/u))
+          .max(128)
+          .default([]),
+        secretExceptions: z
+          .array(z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/u))
+          .max(32)
+          .default([]),
+      })
+      .strict()
+      .default({ allowlist: [], secretExceptions: [] })
+      .superRefine((value, context) => {
+        if (new Set(value.allowlist).size !== value.allowlist.length) {
+          context.addIssue({
+            code: "custom",
+            message: "Environment allowlist names must be unique",
+          });
+        }
+        if (new Set(value.secretExceptions).size !== value.secretExceptions.length) {
+          context.addIssue({ code: "custom", message: "Secret exception names must be unique" });
+        }
+        for (const name of value.secretExceptions) {
+          if (!value.allowlist.includes(name)) {
+            context.addIssue({
+              code: "custom",
+              message: `Secret exception ${name} must also be allowlisted`,
+              path: ["secretExceptions"],
+            });
+          }
+        }
+      }),
     verification: z
       .object({
-        focused: z.array(projectVerificationCommandConfigSchema),
-        full: z.array(projectVerificationCommandConfigSchema),
-        candidates: z.array(projectVerificationCommandConfigSchema),
+        focused: z.array(projectVerificationCommandConfigSchema).max(64),
+        full: z.array(projectVerificationCommandConfigSchema).max(64),
+        candidates: z.array(projectVerificationCommandConfigSchema).max(64),
       })
       .strict(),
   })
@@ -111,6 +160,13 @@ export const projectSchema = z
     detectedStack: detectedStackSchema,
     instructionFiles: z.array(instructionFileReferenceSchema),
     skillMetadata: z.array(skillMetadataSchema),
+    environmentPolicy: z
+      .object({
+        allowlist: z.array(z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/u)).max(128),
+        secretExceptions: z.array(z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/u)).max(32),
+      })
+      .strict()
+      .default({ allowlist: [], secretExceptions: [] }),
     verificationPolicy: verificationPolicySchema,
     createdAt: z.string().datetime(),
     updatedAt: z.string().datetime(),
@@ -133,3 +189,46 @@ export type SkillMetadata = z.infer<typeof skillMetadataSchema>;
 export type VerificationCommand = z.infer<typeof verificationCommandSchema>;
 export type VerificationPolicy = z.infer<typeof verificationPolicySchema>;
 export type ProjectConfig = z.output<typeof projectConfigSchema>;
+
+function containsSensitiveCommandArgument(argv: readonly string[]): boolean {
+  const sensitiveFlag =
+    /^(?:--?|\/)(?:(?:[a-z0-9]+[-_])*(?:cookie|credential|key|password|passwd|secret|token)|(?:api|auth|access|client|private|refresh)(?:key|token))(?:[=:].*)?$/iu;
+  const credentialedUrl = /^[a-z][a-z0-9+.-]*:\/\/[^/@\s:]+:[^/@\s]+@/iu;
+  const authorizationValue = /^(?:basic|bearer)\s+\S+/iu;
+  const authorizationHeader = /^authorization\s*:\s*(?:basic|bearer)\s+\S+/iu;
+  const secretAssignment =
+    /(?:^|[?&/:])(?:[a-z0-9_-]*(?:token|key|secret|password|passwd|cookie|credential|auth)[a-z0-9_-]*)=.+/iu;
+  for (const [index, argument] of argv.entries()) {
+    if (
+      sensitiveFlag.test(argument) ||
+      credentialedUrl.test(argument) ||
+      authorizationValue.test(argument) ||
+      authorizationHeader.test(argument) ||
+      secretAssignment.test(argument)
+    ) {
+      return true;
+    }
+    const following = argv[index + 1] ?? "";
+    const inlineValue = argument.includes("=") ? argument.slice(argument.indexOf("=") + 1) : "";
+    if (
+      /^(?:-u|--user|--proxy-user|--ftp-account)(?:=|$)/iu.test(argument) &&
+      /\S+:\S+/u.test(inlineValue || following)
+    ) {
+      return true;
+    }
+    if (
+      /^(?:-H|--header)(?:=|$)/u.test(argument) &&
+      /^(?:authorization|proxy-authorization|x-api-key|x-auth-token|cookie|set-cookie)\s*:/iu.test(
+        inlineValue || following,
+      )
+    ) {
+      return true;
+    }
+    if (
+      /(?:^|=)(?:authorization|proxy-authorization|x-api-key|x-auth-token)\s*:/iu.test(argument)
+    ) {
+      return true;
+    }
+  }
+  return false;
+}

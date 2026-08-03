@@ -12,7 +12,7 @@ describe("EnvironmentSanitizer", () => {
         API_TOKEN: "secret",
         SAFE_PROJECT_SETTING: "on",
       },
-      { additionalAllowedNames: ["API_TOKEN", "SAFE_PROJECT_SETTING"] },
+      { additionalAllowedNames: ["API_TOKEN", "NODE_OPTIONS", "SAFE_PROJECT_SETTING"] },
     );
 
     expect(result.environment).toEqual({
@@ -21,6 +21,9 @@ describe("EnvironmentSanitizer", () => {
       SAFE_PROJECT_SETTING: "on",
     });
     expect(result.warnings).toContain("Omitted sensitive environment variable API_TOKEN");
+    expect(result.warnings).toContain(
+      "Omitted unsafe loader or startup environment variable NODE_OPTIONS",
+    );
   });
 
   it("allows a named sensitive exception while warning without exposing its value", () => {

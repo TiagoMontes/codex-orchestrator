@@ -7,7 +7,7 @@ import type { TaskRunner, TaskRunOverrides } from "../../application/tasks/task-
 import { OrchestratorError } from "../../shared/errors.js";
 import { parseCliValue } from "../validation.js";
 import type { OutputWriter } from "../output.js";
-import { writeResult } from "../output.js";
+import { codexProgressWriter, writeResult } from "../output.js";
 
 export function registerTaskRunCommand(
   task: Command,
@@ -29,8 +29,13 @@ export function registerTaskRunCommand(
     .option("--timeout <duration>")
     .description("Implement in an isolated worktree and run deterministic verification")
     .action(async (taskId: string, options: Record<string, string | boolean | undefined>) => {
-      const report = await runner.run(taskId, parseOverrides(options));
-      if (program.opts<{ json?: boolean }>().json ?? false) {
+      const json = program.opts<{ json?: boolean }>().json ?? false;
+      if (!json) output.write("[implementation] preparing isolated writer worktree");
+      const report = await runner.run(taskId, {
+        ...parseOverrides(options),
+        ...(json ? {} : { progress: codexProgressWriter(output) }),
+      });
+      if (json) {
         writeResult(output, report, true);
         return;
       }

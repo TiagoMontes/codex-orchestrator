@@ -1,4 +1,4 @@
-import { access, constants, readFile } from "node:fs/promises";
+import { access, constants, mkdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { z } from "zod";
 import type { Clock } from "../../shared/clock.js";
@@ -27,6 +27,10 @@ import { PersistedTaskCancellation } from "./persisted-task-cancellation.js";
 import { enrichRisk } from "./risk-enricher.js";
 import { taskFailureStatus } from "./task-failure-policy.js";
 import type { TaskNormalizer } from "./task-normalizer.js";
+import { recoverInterruptedUsage } from "./interrupted-usage-recovery.js";
+import { GitClientFactory } from "../../infrastructure/git/git-client-factory.js";
+import { sha256 } from "../../shared/hashing.js";
+import type { CodexProgressObserver } from "../../infrastructure/codex/codex-runtime.js";
 
 const normalizationPlanSchema = z
   .object({
@@ -55,6 +59,7 @@ export interface TaskManager {
     project: string;
     feedback: string;
     profile: ExecutionProfile;
+    progress?: CodexProgressObserver;
   }): Promise<TaskCreateResult>;
   resumeNormalization?(taskId: string): Promise<TaskCreateResult>;
   list(filter?: { project?: string; status?: TaskStatus }): Promise<Task[]>;
@@ -67,6 +72,7 @@ export class TaskService implements TaskManager {
   private readonly locks: FileLockManager;
   private readonly store = new AtomicJsonStore();
   private readonly deterministicNormalizer = new DeterministicTaskNormalizer();
+  private readonly gitClients: GitClientFactory;
 
   constructor(
     private readonly paths: StatePaths,
@@ -78,12 +84,14 @@ export class TaskService implements TaskManager {
     private readonly clock: Clock = systemClock,
   ) {
     this.locks = new FileLockManager(paths.locksDirectory);
+    this.gitClients = new GitClientFactory(paths);
   }
 
   async create(input: {
     project: string;
     feedback: string;
     profile: ExecutionProfile;
+    progress?: CodexProgressObserver;
   }): Promise<TaskCreateResult> {
     if (input.feedback.trim() === "") {
       throw new OrchestratorError("Task feedback must not be empty", { code: "CLI_INPUT" });
@@ -101,6 +109,10 @@ export class TaskService implements TaskManager {
           parentId,
           input.feedback,
         );
+        const normalizationDirectory = await this.prepareNormalizationRepository({
+          id: parentId,
+          projectId: project.id,
+        });
         const timestamp = isoNow(this.clock);
         const provisionalDraft = taskDraftSchema.parse(
           await this.deterministicNormalizer.normalize({
@@ -108,7 +120,7 @@ export class TaskService implements TaskManager {
             projectId: project.id,
             profile: input.profile,
             originalFeedback: input.feedback,
-            workingDirectory: project.gitRoot,
+            workingDirectory: normalizationDirectory,
           }),
         );
         const task = this.buildTask({
@@ -116,6 +128,7 @@ export class TaskService implements TaskManager {
           projectId: project.id,
           profile: input.profile,
           originalPath,
+          originalSha256: sha256(input.feedback),
           draft: provisionalDraft,
           childTaskIds: [],
           timestamp,
@@ -123,7 +136,7 @@ export class TaskService implements TaskManager {
           status: "normalizing",
         });
         await this.tasks.create(task, this.initialNormalizingState(parentId, timestamp));
-        return await this.normalizePersistedTask(task, project.gitRoot, input.feedback);
+        return await this.normalizePersistedTask(task, input.feedback, input.progress);
       } finally {
         await operationLock.release();
       }
@@ -138,8 +151,7 @@ export class TaskService implements TaskManager {
     try {
       const operationLock = await this.locks.acquire(`task-operation:${taskId}`);
       try {
-        let task = await this.tasks.get(taskId);
-        let state = await this.tasks.getState(taskId);
+        let { task, state } = await this.tasks.getSnapshot(taskId);
         if (
           (state.status !== "blocked" && state.status !== "cancelled") ||
           (state.resumableFrom !== "normalizing" && state.resumableFrom !== "created")
@@ -149,8 +161,8 @@ export class TaskService implements TaskManager {
             { code: "TASK_STATE" },
           );
         }
+        await recoverInterruptedUsage(task, this.usage, this.executions);
         await this.reconcileInterruptedExecutions(task, state.status);
-        await this.usage?.releaseAllReservations(task.projectId, task.id);
         const timestamp = isoNow(this.clock);
         state = this.stateMachine.transition(state, {
           nextState: "normalizing",
@@ -165,18 +177,19 @@ export class TaskService implements TaskManager {
           updatedAt: timestamp,
         };
         await this.tasks.update(task, state);
-        const project = await this.projects.inspect(task.projectId);
         const expectedFeedbackPath = this.tasks.originalFeedbackPath(task.projectId, task.id);
         if (task.originalFeedbackPath !== expectedFeedbackPath) {
           throw new OrchestratorError("Original feedback path is not bound to the task", {
             code: "CONTEXT_INTEGRITY",
           });
         }
-        return await this.normalizePersistedTask(
-          task,
-          project.gitRoot,
-          await readFile(expectedFeedbackPath, "utf8"),
-        );
+        const originalFeedback = await readFile(expectedFeedbackPath, "utf8");
+        if (sha256(originalFeedback) !== task.originalFeedbackSha256) {
+          throw new OrchestratorError("Original feedback content changed after intake", {
+            code: "CONTEXT_INTEGRITY",
+          });
+        }
+        return await this.normalizePersistedTask(task, originalFeedback);
       } finally {
         await operationLock.release();
       }
@@ -197,18 +210,20 @@ export class TaskService implements TaskManager {
   }
 
   async status(taskId: string): Promise<{ task: Task; state: TaskStateDocument }> {
-    return { task: await this.tasks.get(taskId), state: await this.tasks.getState(taskId) };
+    return this.tasks.getSnapshot(taskId);
   }
 
   private async normalizePersistedTask(
     initialTask: Task,
-    workingDirectory: string,
     originalFeedback: string,
+    progress?: CodexProgressObserver,
   ): Promise<TaskCreateResult> {
     const cancellation = new PersistedTaskCancellation(this.tasks, initialTask.id);
     try {
       let plan = await this.readNormalizationPlan(initialTask.projectId, initialTask.id);
       if (plan === undefined) {
+        const workingDirectory = await this.prepareNormalizationRepository(initialTask);
+        const project = await this.projects.inspect(initialTask.projectId);
         const draft = taskDraftSchema.parse(
           await this.normalizer.normalize({
             taskId: initialTask.id,
@@ -216,6 +231,9 @@ export class TaskService implements TaskManager {
             profile: initialTask.profile,
             originalFeedback,
             workingDirectory,
+            additionalAllowedEnvironmentNames: project.environmentPolicy.allowlist,
+            explicitSecretEnvironmentExceptions: project.environmentPolicy.secretExceptions,
+            ...(progress === undefined ? {} : { progress }),
             abortSignal: cancellation.signal,
           }),
         );
@@ -224,9 +242,7 @@ export class TaskService implements TaskManager {
           schemaVersion: 1,
           taskId: initialTask.id,
           draft,
-          childTaskIds: await Promise.all(
-            draft.childTasks.map(async (child) => this.tasks.allocateId(child.type)),
-          ),
+          childTaskIds: await allocateChildTaskIds(this.tasks, draft.childTasks),
           createdAt: isoNow(this.clock),
         });
         await this.store.write(
@@ -237,8 +253,7 @@ export class TaskService implements TaskManager {
       return await this.finalizeNormalization(initialTask.id, plan, cancellation.signal);
     } catch (error) {
       let normalized = toOrchestratorError(error);
-      const task = await this.tasks.get(initialTask.id);
-      const state = await this.tasks.getState(initialTask.id);
+      const { task, state } = await this.tasks.getSnapshot(initialTask.id);
       if (state.status === "cancelled") {
         normalized = new OrchestratorError(`Task ${initialTask.id} normalization was cancelled`, {
           code: "CANCELLED",
@@ -272,7 +287,7 @@ export class TaskService implements TaskManager {
         cause: normalized,
       });
     } finally {
-      cancellation.dispose();
+      await cancellation.dispose();
     }
   }
 
@@ -286,8 +301,7 @@ export class TaskService implements TaskManager {
         code: "CONTEXT_INTEGRITY",
       });
     }
-    let parent = await this.tasks.get(taskId);
-    let parentState = await this.tasks.getState(taskId);
+    let { task: parent, state: parentState } = await this.tasks.getSnapshot(taskId);
     if (parentState.status !== "normalizing") {
       throw new OrchestratorError(`Task ${taskId} left normalization before finalization`, {
         code: "TASK_STATE",
@@ -320,6 +334,7 @@ export class TaskService implements TaskManager {
         projectId: parent.projectId,
         profile: parent.profile,
         originalPath: parent.originalFeedbackPath,
+        originalSha256: parent.originalFeedbackSha256,
         draft: childDraft,
         childTaskIds: [],
         parentTaskId: taskId,
@@ -332,8 +347,7 @@ export class TaskService implements TaskManager {
     }
 
     this.throwIfCancelled(abortSignal, taskId);
-    parent = await this.tasks.get(taskId);
-    parentState = await this.tasks.getState(taskId);
+    ({ task: parent, state: parentState } = await this.tasks.getSnapshot(taskId));
     if (parentState.status !== "normalizing") {
       throw new OrchestratorError(`Task ${taskId} was interrupted during normalization`, {
         code: parentState.status === "cancelled" ? "CANCELLED" : "TASK_STATE",
@@ -346,6 +360,7 @@ export class TaskService implements TaskManager {
       projectId: parent.projectId,
       profile: parent.profile,
       originalPath: parent.originalFeedbackPath,
+      originalSha256: parent.originalFeedbackSha256,
       draft: plan.draft,
       childTaskIds: plan.childTaskIds,
       timestamp,
@@ -372,6 +387,7 @@ export class TaskService implements TaskManager {
     projectId: string;
     profile: ExecutionProfile;
     originalPath: string;
+    originalSha256: string;
     draft: TaskDraftBase | TaskDraft;
     childTaskIds: string[];
     parentTaskId?: string;
@@ -390,6 +406,7 @@ export class TaskService implements TaskManager {
       title: input.draft.title,
       summary: input.draft.summary,
       originalFeedbackPath: input.originalPath,
+      originalFeedbackSha256: input.originalSha256,
       profile: input.profile,
       risk: enrichRisk(input.draft.riskSignals),
       riskSignals: input.draft.riskSignals,
@@ -436,6 +453,20 @@ export class TaskService implements TaskManager {
     return join(this.paths.taskDirectory(projectId, taskId), "normalization-plan.json");
   }
 
+  private async prepareNormalizationRepository(
+    task: Pick<Task, "id" | "projectId">,
+  ): Promise<string> {
+    const path = join(
+      this.paths.taskDirectory(task.projectId, task.id),
+      "normalization-repository",
+    );
+    await mkdir(path, { recursive: true, mode: 0o700 });
+    await this.gitClients
+      .task(task.projectId, task.id, { phase: "normalization" })
+      .initializeEmptyRepository(path);
+    return path;
+  }
+
   private async readNormalizationPlan(
     projectId: string,
     taskId: string,
@@ -479,4 +510,13 @@ export class TaskService implements TaskManager {
       });
     }
   }
+}
+
+async function allocateChildTaskIds(
+  tasks: TaskFileRepository,
+  drafts: readonly TaskDraftBase[],
+): Promise<string[]> {
+  const ids: string[] = [];
+  for (const draft of drafts) ids.push(await tasks.allocateId(draft.type));
+  return ids;
 }

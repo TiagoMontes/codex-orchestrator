@@ -10,6 +10,10 @@ import { sha256 } from "../../shared/hashing.js";
 import { canonicalizeExistingPath } from "../filesystem/path-safety.js";
 import { EnvironmentSanitizer } from "./environment-sanitizer.js";
 import { LogRedactor } from "./log-redactor.js";
+import {
+  prepareVerificationSandbox,
+  type VerificationSandboxKind,
+} from "./verification-sandbox.js";
 
 export type CommandRunRequest = {
   argv: string[];
@@ -18,6 +22,8 @@ export type CommandRunRequest = {
   logPath: string;
   abortSignal?: AbortSignal;
   environment?: Readonly<Record<string, string | undefined>>;
+  additionalAllowedEnvironmentNames?: readonly string[];
+  explicitSecretEnvironmentExceptions?: readonly string[];
 };
 
 export type CommandRunResult = {
@@ -28,6 +34,8 @@ export type CommandRunResult = {
   timedOut: boolean;
   aborted: boolean;
   spawnError?: string;
+  sandbox: VerificationSandboxKind | "not-started";
+  sandboxError?: string;
   logPath: string;
   logSha256: string;
   excerpt: string;
@@ -76,22 +84,54 @@ export class CommandRunner {
         exitCode: null,
         timedOut: false,
         aborted: true,
+        sandbox: "not-started",
         logPath: request.logPath,
         logSha256,
         excerpt,
       };
     }
-    const environment = this.sanitizer.sanitize(request.environment ?? process.env).environment;
-    const command = request.argv[0] as string;
-    const args = request.argv.slice(1);
+    const environment = this.sanitizer.sanitize(request.environment ?? process.env, {
+      ...(request.additionalAllowedEnvironmentNames === undefined
+        ? {}
+        : { additionalAllowedNames: request.additionalAllowedEnvironmentNames }),
+      ...(request.explicitSecretEnvironmentExceptions === undefined
+        ? {}
+        : { explicitSecretExceptions: request.explicitSecretEnvironmentExceptions }),
+    }).environment;
+    const sandbox = await prepareVerificationSandbox({ argv: request.argv, cwd, environment });
+    if ("error" in sandbox) {
+      log.push("stderr", Buffer.from(`[orchestrator] ${sandbox.error}\n`));
+      const { excerpt, logSha256 } = await log.close();
+      return {
+        startedAt,
+        completedAt: isoNow(this.clock),
+        exitCode: null,
+        timedOut: false,
+        aborted: false,
+        spawnError: sandbox.error,
+        sandbox: "not-started",
+        sandboxError: sandbox.error,
+        logPath: request.logPath,
+        logSha256,
+        excerpt,
+      };
+    }
+    const command = sandbox.command;
+    const args = sandbox.args;
     let timedOut = false;
     let aborted = false;
     let forceKillTimer: NodeJS.Timeout | undefined;
+    let forceSettleTimer: NodeJS.Timeout | undefined;
+    let forceSettle:
+      | ((value: { exitCode: number | null; signal?: string; spawnError?: string }) => void)
+      | undefined;
+    let forcedSettlement = false;
     const child = spawn(command, args, {
       cwd,
-      env: environment,
+      env: sandbox.environment,
       shell: false,
       stdio: ["ignore", "pipe", "pipe"],
+      detached: process.platform !== "win32",
     });
     child.stdout.on("data", (chunk: Buffer) => log.push("stdout", chunk));
     child.stderr.on("data", (chunk: Buffer) => log.push("stderr", chunk));
@@ -104,11 +144,22 @@ export class CommandRunner {
         if (aborted) return;
         aborted = true;
       }
-      if (!child.killed) child.kill("SIGTERM");
+      killProcessGroup(child.pid, "SIGTERM", () => child.kill("SIGTERM"));
       forceKillTimer = setTimeout(() => {
-        if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+        killProcessGroup(child.pid, "SIGKILL", () => child.kill("SIGKILL"));
       }, 1_000);
       forceKillTimer.unref();
+      forceSettleTimer = setTimeout(() => {
+        forcedSettlement = true;
+        child.stdout.destroy();
+        child.stderr.destroy();
+        forceSettle?.({
+          exitCode: null,
+          signal: "SIGKILL",
+          spawnError: "Verification command did not close after forced termination",
+        });
+      }, 2_000);
+      forceSettleTimer.unref();
     };
     const timeout = setTimeout(() => terminate("timeout"), request.timeoutMs);
     timeout.unref();
@@ -131,6 +182,7 @@ export class CommandRunner {
         settled = true;
         resolve(value);
       };
+      forceSettle = settle;
       child.once("error", (error) =>
         settle({ exitCode: null, spawnError: this.redactor.redact(error.message) }),
       );
@@ -142,9 +194,23 @@ export class CommandRunner {
       );
     });
     clearTimeout(timeout);
+    if (timedOut || aborted) {
+      killProcessGroup(child.pid, "SIGKILL", () => child.kill("SIGKILL"));
+    }
     if (forceKillTimer !== undefined) clearTimeout(forceKillTimer);
+    if (forceSettleTimer !== undefined) clearTimeout(forceSettleTimer);
     request.abortSignal?.removeEventListener("abort", abortListener);
     const { excerpt, logSha256 } = await log.close();
+    let sandboxError = detectSandboxError(sandbox.kind, excerpt);
+    if (forcedSettlement) {
+      sandboxError ??=
+        "Verification command descendants did not terminate within the hard deadline";
+    }
+    if (!timedOut && !aborted && processGroupExists(child.pid)) {
+      killProcessGroup(child.pid, "SIGKILL", () => child.kill("SIGKILL"));
+      sandboxError ??= "Verification command left descendant processes running";
+    }
+    await sandbox.cleanup();
     return {
       startedAt,
       completedAt: isoNow(this.clock),
@@ -153,10 +219,50 @@ export class CommandRunner {
       timedOut,
       aborted,
       ...(outcome.spawnError === undefined ? {} : { spawnError: outcome.spawnError }),
+      sandbox: sandbox.kind,
+      ...(sandboxError === undefined ? {} : { sandboxError }),
       logPath: request.logPath,
       logSha256,
       excerpt,
     };
+  }
+}
+
+function detectSandboxError(kind: VerificationSandboxKind, excerpt: string): string | undefined {
+  const setupFailure =
+    kind === "seatbelt"
+      ? /sandbox-exec:.*(?:sandbox_apply|execvp|operation not permitted)/iu
+      : /bwrap:.*(?:unknown option|operation not permitted|permission denied|cannot|can't|failed|creating new namespace|no permissions|execvp)/iu;
+  return setupFailure.test(excerpt) ? "Verification sandbox setup failed" : undefined;
+}
+
+function processGroupExists(processId: number | undefined): boolean {
+  if (processId === undefined || process.platform === "win32") return false;
+  try {
+    process.kill(-processId, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function killProcessGroup(
+  processId: number | undefined,
+  signal: NodeJS.Signals,
+  fallback: () => boolean,
+): void {
+  if (processId !== undefined && process.platform !== "win32") {
+    try {
+      process.kill(-processId, signal);
+      return;
+    } catch {
+      // The child may have exited between the state check and the signal.
+    }
+  }
+  try {
+    fallback();
+  } catch {
+    // Termination is best effort after the process has already exited.
   }
 }
 

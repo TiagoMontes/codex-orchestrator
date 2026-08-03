@@ -10,6 +10,11 @@ const REDACTION_PATTERNS: ReadonlyArray<{
   },
   {
     pattern:
+      /(^|\s)(--?[A-Za-z0-9_-]*(?:token|api[-_]?key|secret|password|passphrase|auth(?:orization)?|cookie)[A-Za-z0-9_-]*)(\s+|=)(?:"[^"]*"|'[^']*'|[^\s,;]+)/gimu,
+    replace: `$1$2$3${REDACTION}`,
+  },
+  {
+    pattern:
       /\b([A-Za-z0-9_]*(?:TOKEN|KEY|SECRET|PASSWORD|PASS|AUTH|COOKIE|DATABASE_URL|AWS_[A-Za-z0-9_]*|GCP_[A-Za-z0-9_]*|AZURE_[A-Za-z0-9_]*)\s*[=:]\s*)([^\s,;]+)/giu,
     replace: `$1${REDACTION}`,
   },

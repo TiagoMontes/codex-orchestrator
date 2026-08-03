@@ -1,4 +1,4 @@
-import { access, constants, readFile, rm } from "node:fs/promises";
+import { access, constants, open, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { parse, stringify } from "yaml";
 import type { Clock } from "../../shared/clock.js";
@@ -22,7 +22,7 @@ export class ProjectFileRepository {
   private readonly locks: FileLockManager;
 
   constructor(
-    private readonly paths: StatePaths,
+    readonly paths: StatePaths,
     private readonly store = new AtomicJsonStore(),
     private readonly textWriter = new AtomicFileWriter(),
     private readonly clock: Clock = systemClock,
@@ -63,10 +63,7 @@ export class ProjectFileRepository {
       const configPath = this.projectConfigFile(project.id);
       const configExists = await exists(configPath);
       const persisted = configExists
-        ? {
-            ...project,
-            verificationPolicy: (await this.readConfig(configPath, project.id)).verification,
-          }
+        ? projectFromConfig(project, await this.readConfig(configPath, project.id))
         : project;
       if (!configExists) {
         await this.textWriter.writeText(configPath, stringify(toProjectConfig(project)));
@@ -101,7 +98,7 @@ export class ProjectFileRepository {
   private async getById(id: string): Promise<Project> {
     const project = await this.store.read(this.projectFile(id), projectSchema);
     const config = await this.readConfig(this.projectConfigFile(id), id);
-    return projectSchema.parse({ ...project, verificationPolicy: config.verification });
+    return projectSchema.parse(projectFromConfig(project, config));
   }
 
   private projectFile(id: string): string {
@@ -114,13 +111,39 @@ export class ProjectFileRepository {
 
   private async readConfig(path: string, projectId: string): Promise<ProjectConfig> {
     let input: unknown;
+    let handle: Awaited<ReturnType<typeof open>> | undefined;
     try {
-      input = parse(await readFile(path, "utf8")) as unknown;
+      try {
+        handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+      } catch (error) {
+        if (isNoFollowFailure(error)) {
+          throw new OrchestratorError(`Project configuration must be a regular file: ${path}`, {
+            code: "CONFIGURATION",
+            cause: error,
+          });
+        }
+        throw error;
+      }
+      const metadata = await handle.stat();
+      if (!metadata.isFile()) {
+        throw new OrchestratorError(`Project configuration must be a regular file: ${path}`, {
+          code: "CONFIGURATION",
+        });
+      }
+      if (metadata.size > 1_048_576) {
+        throw new OrchestratorError(`Project configuration exceeds the 1 MiB limit: ${path}`, {
+          code: "CONFIGURATION",
+        });
+      }
+      input = parse(await readBounded(handle, 1_048_576), { maxAliasCount: 20 }) as unknown;
     } catch (error) {
+      if (error instanceof OrchestratorError) throw error;
       throw new OrchestratorError(`Project configuration is not valid YAML: ${path}`, {
         code: "CONFIGURATION",
         cause: error,
       });
+    } finally {
+      await handle?.close().catch(() => undefined);
     }
     const result = projectConfigSchema.safeParse(input);
     if (!result.success) {
@@ -161,11 +184,20 @@ function toProjectConfig(project: Project): Record<string, unknown> {
   return {
     schemaVersion: 1,
     projectId: project.id,
+    environment: project.environmentPolicy,
     verification: {
       focused: project.verificationPolicy.focused.map(configured),
       full: project.verificationPolicy.full.map(configured),
       candidates: project.verificationPolicy.candidates.map(configured),
     },
+  };
+}
+
+function projectFromConfig(project: Project, config: ProjectConfig): Project {
+  return {
+    ...project,
+    environmentPolicy: config.environment,
+    verificationPolicy: config.verification,
   };
 }
 
@@ -176,4 +208,29 @@ async function exists(path: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+async function readBounded(
+  handle: Awaited<ReturnType<typeof open>>,
+  maximumBytes: number,
+): Promise<string> {
+  const buffer = Buffer.alloc(maximumBytes + 1);
+  let offset = 0;
+  while (offset < buffer.length) {
+    const { bytesRead } = await handle.read(buffer, offset, buffer.length - offset, offset);
+    if (bytesRead === 0) break;
+    offset += bytesRead;
+  }
+  if (offset > maximumBytes) {
+    throw new OrchestratorError("Project configuration exceeds the 1 MiB limit", {
+      code: "CONFIGURATION",
+    });
+  }
+  return buffer.subarray(0, offset).toString("utf8");
+}
+
+function isNoFollowFailure(error: unknown): boolean {
+  return (
+    error instanceof Error && "code" in error && (error.code === "ELOOP" || error.code === "EMLINK")
+  );
 }

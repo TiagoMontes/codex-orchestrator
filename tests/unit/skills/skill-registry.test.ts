@@ -99,6 +99,7 @@ describe("SkillRegistry", () => {
           tags: ["diagnosis"],
         },
       ],
+      environmentPolicy: { allowlist: [], secretExceptions: [] },
       verificationPolicy: { focused: [], full: [], candidates: [] },
       createdAt: "2026-08-02T12:00:00.000Z",
       updatedAt: "2026-08-02T12:00:00.000Z",

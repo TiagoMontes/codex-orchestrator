@@ -7,21 +7,26 @@ import type { DoctorCheck } from "./doctor-types.js";
 import type { ConfigService } from "../configuration/config-service.js";
 import type { StatePaths } from "../../infrastructure/persistence/state-paths.js";
 import { LogRedactor } from "../../infrastructure/process/log-redactor.js";
+import { GitClientFactory } from "../../infrastructure/git/git-client-factory.js";
+import type { GitClient } from "../../infrastructure/git/git-client.js";
 
 const packageMetadataSchema = z.object({ version: z.string().min(1) }).passthrough();
 
 export class LocalDoctorSystem {
   private readonly redactor = new LogRedactor();
+  private readonly git: GitClient;
 
   constructor(
     private readonly configService: ConfigService,
     private readonly paths: StatePaths = configService.paths,
-  ) {}
+  ) {
+    this.git = new GitClientFactory(paths).global({ phase: "doctor" });
+  }
 
   async checks(): Promise<DoctorCheck[]> {
     const node = this.checkNode();
     const [git, codexCli, codexSdk, state, worktree, configuration] = await Promise.all([
-      this.checkExecutable("git", ["--version"], "Git"),
+      this.checkGit(),
       this.checkExecutable("codex", ["--version"], "Codex CLI", true),
       this.checkCodexSdk(),
       this.checkStateDirectory(),
@@ -29,6 +34,18 @@ export class LocalDoctorSystem {
       this.checkConfiguration(),
     ]);
     return [node, git, codexCli, codexSdk, state, worktree, configuration];
+  }
+
+  private async checkGit(): Promise<DoctorCheck> {
+    try {
+      return {
+        name: "git",
+        status: "pass",
+        message: firstUsefulLine(this.redactor.redact(await this.git.gitVersion()), "Git"),
+      };
+    } catch {
+      return { name: "git", status: "fail", message: "Git is not available" };
+    }
   }
 
   private checkNode(): DoctorCheck {
@@ -109,21 +126,12 @@ export class LocalDoctorSystem {
     let temporaryRepository: string | undefined;
     try {
       temporaryRepository = await mkdtemp(join(this.paths.tempDirectory, "doctor-git-"));
-      const initialized = await execa("git", ["init", "--quiet"], {
-        cwd: temporaryRepository,
-        reject: false,
-        timeout: 10_000,
-      });
-      const worktree = await execa("git", ["worktree", "list", "--porcelain"], {
-        cwd: temporaryRepository,
-        reject: false,
-        timeout: 10_000,
-      });
-      const passed = initialized.exitCode === 0 && worktree.exitCode === 0;
+      await this.git.initializeEmptyRepository(temporaryRepository);
+      await this.git.listWorktreesPorcelain(temporaryRepository);
       return {
         name: "git-worktree",
-        status: passed ? "pass" : "fail",
-        message: passed ? "Git worktree support is available" : "Git worktree support check failed",
+        status: "pass",
+        message: "Git worktree support is available",
       };
     } catch {
       return {

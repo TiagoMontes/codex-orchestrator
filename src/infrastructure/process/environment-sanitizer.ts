@@ -11,6 +11,8 @@ const DEFAULT_OPERATIONAL_ALLOWLIST = [
 
 const SECRET_NAME_PATTERN =
   /(TOKEN|KEY|SECRET|PASSWORD|PASS|AUTH|COOKIE|DATABASE_URL|AWS_|GCP_|AZURE_)/iu;
+const UNSAFE_LOADER_NAME_PATTERN =
+  /^(?:BASH_ENV|ENV|GIT_CONFIG(?:_COUNT|_KEY_\d+|_VALUE_\d+|_GLOBAL|_SYSTEM)|LD_|DYLD_|NODE_OPTIONS|PERL5OPT|PYTHONPATH|RUBYOPT)/u;
 
 export type SanitizeEnvironmentOptions = {
   additionalAllowedNames?: readonly string[];
@@ -37,6 +39,10 @@ export class EnvironmentSanitizer {
     for (const name of [...allowed].sort()) {
       const value = source[name];
       if (value === undefined) {
+        continue;
+      }
+      if (UNSAFE_LOADER_NAME_PATTERN.test(name)) {
+        warnings.push(`Omitted unsafe loader or startup environment variable ${name}`);
         continue;
       }
       if (SECRET_NAME_PATTERN.test(name) && !exceptions.has(name)) {

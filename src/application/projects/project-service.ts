@@ -5,7 +5,8 @@ import { sha256 } from "../../shared/hashing.js";
 import { OrchestratorError } from "../../shared/errors.js";
 import { projectSchema, type Project } from "../../domain/project/project.js";
 import type { Task } from "../../domain/task/task.js";
-import { GitClient } from "../../infrastructure/git/git-client.js";
+import type { GitClient } from "../../infrastructure/git/git-client.js";
+import { GitClientFactory } from "../../infrastructure/git/git-client-factory.js";
 import type { ProjectFileRepository } from "../../infrastructure/persistence/project-file-repository.js";
 import { FileLockManager, type AcquiredLock } from "../../infrastructure/persistence/file-lock.js";
 import type { StatePaths } from "../../infrastructure/persistence/state-paths.js";
@@ -20,11 +21,12 @@ export interface ProjectManager {
 }
 
 export class ProjectService implements ProjectManager {
-  private readonly operationLocks: FileLockManager | undefined;
+  private readonly operationLocks: FileLockManager;
+  private readonly git: GitClient;
 
   constructor(
     private readonly repository: ProjectFileRepository,
-    private readonly git = new GitClient(),
+    git: GitClient | undefined = undefined,
     private readonly stackDetector = new StackDetector(),
     private readonly metadataScanner = new ProjectMetadataScanner(),
     private readonly clock: Clock = systemClock,
@@ -34,54 +36,65 @@ export class ProjectService implements ProjectManager {
     },
     paths?: StatePaths,
   ) {
-    this.operationLocks =
-      paths === undefined ? undefined : new FileLockManager(paths.locksDirectory);
+    const statePaths = paths ?? repository.paths;
+    this.operationLocks = new FileLockManager(statePaths.locksDirectory);
+    this.git = git ?? new GitClientFactory(statePaths).global();
   }
 
   async add(input: { path: string; name?: string; baseRef?: string }): Promise<Project> {
-    const gitMetadata = await this.git.inspectRepository(input.path);
-    const existing = (await this.repository.list()).find(
-      (project) => project.gitRoot === gitMetadata.gitRoot,
-    );
-    if (existing !== undefined) {
-      throw new OrchestratorError(`Repository is already registered as ${existing.id}`, {
-        code: "PROJECT",
+    const registrationLock = await this.operationLocks.acquire("project-registration");
+    try {
+      const gitMetadata = await this.git.inspectRepository(input.path);
+      const existing = (await this.repository.list()).find(
+        (project) => project.gitRoot === gitMetadata.gitRoot,
+      );
+      if (existing !== undefined) {
+        throw new OrchestratorError(`Repository is already registered as ${existing.id}`, {
+          code: "PROJECT",
+        });
+      }
+      const baseRef = await this.git.resolveBaseRef(
+        gitMetadata.gitRoot,
+        input.baseRef,
+        gitMetadata,
+      );
+      await this.git.resolveCommit(gitMetadata.gitRoot, baseRef);
+      const [{ stack, verificationPolicy }, metadata] = await Promise.all([
+        this.stackDetector.detect(gitMetadata.gitRoot),
+        this.metadataScanner.scan(gitMetadata.gitRoot),
+      ]);
+      const name = input.name?.trim() || basename(gitMetadata.gitRoot);
+      const id = await this.uniqueId(name, gitMetadata.gitRoot);
+      const timestamp = isoNow(this.clock);
+      const project = projectSchema.parse({
+        schemaVersion: 1,
+        id,
+        name,
+        repositoryPath: gitMetadata.repositoryPath,
+        gitRoot: gitMetadata.gitRoot,
+        baseRef,
+        registeredHeadCommit: gitMetadata.headCommit,
+        currentHeadCommit: gitMetadata.headCommit,
+        ...(gitMetadata.currentBranch === undefined
+          ? {}
+          : { currentBranch: gitMetadata.currentBranch }),
+        ...(gitMetadata.defaultBranch === undefined
+          ? {}
+          : { defaultBranch: gitMetadata.defaultBranch }),
+        remotes: gitMetadata.remotes,
+        detectedStack: stack,
+        instructionFiles: metadata.instructionFiles,
+        skillMetadata: metadata.skillMetadata,
+        environmentPolicy: { allowlist: [], secretExceptions: [] },
+        verificationPolicy,
+        createdAt: timestamp,
+        updatedAt: timestamp,
       });
+      await this.repository.save(project);
+      return project;
+    } finally {
+      await registrationLock.release();
     }
-    const baseRef = await this.git.resolveBaseRef(gitMetadata.gitRoot, input.baseRef, gitMetadata);
-    await this.git.resolveCommit(gitMetadata.gitRoot, baseRef);
-    const [{ stack, verificationPolicy }, metadata] = await Promise.all([
-      this.stackDetector.detect(gitMetadata.gitRoot),
-      this.metadataScanner.scan(gitMetadata.gitRoot),
-    ]);
-    const name = input.name?.trim() || basename(gitMetadata.gitRoot);
-    const id = await this.uniqueId(name, gitMetadata.gitRoot);
-    const timestamp = isoNow(this.clock);
-    const project = projectSchema.parse({
-      schemaVersion: 1,
-      id,
-      name,
-      repositoryPath: gitMetadata.repositoryPath,
-      gitRoot: gitMetadata.gitRoot,
-      baseRef,
-      registeredHeadCommit: gitMetadata.headCommit,
-      currentHeadCommit: gitMetadata.headCommit,
-      ...(gitMetadata.currentBranch === undefined
-        ? {}
-        : { currentBranch: gitMetadata.currentBranch }),
-      ...(gitMetadata.defaultBranch === undefined
-        ? {}
-        : { defaultBranch: gitMetadata.defaultBranch }),
-      remotes: gitMetadata.remotes,
-      detectedStack: stack,
-      instructionFiles: metadata.instructionFiles,
-      skillMetadata: metadata.skillMetadata,
-      verificationPolicy,
-      createdAt: timestamp,
-      updatedAt: timestamp,
-    });
-    await this.repository.save(project);
-    return project;
   }
 
   list(): Promise<Project[]> {
@@ -97,23 +110,20 @@ export class ProjectService implements ProjectManager {
     let projectLock: AcquiredLock | undefined;
     const taskLocks: AcquiredLock[] = [];
     try {
-      if (this.operationLocks !== undefined) {
-        try {
-          projectLock = await this.operationLocks.acquire(`project-operation:${project.id}`);
-        } catch (error) {
-          throw new OrchestratorError(`Project ${project.id} has an active intake operation`, {
-            code: "PROJECT",
-            resumable: true,
-            nextCommand: `cxo project inspect ${project.id}`,
-            cause: error,
-          });
-        }
+      try {
+        projectLock = await this.operationLocks.acquire(`project-operation:${project.id}`);
+      } catch (error) {
+        throw new OrchestratorError(`Project ${project.id} has an active operation`, {
+          code: "PROJECT",
+          resumable: true,
+          nextCommand: `cxo project inspect ${project.id}`,
+          cause: error,
+        });
       }
       let tasks = await this.tasks?.list(project.id);
       for (const task of [...(tasks ?? [])].sort((left, right) =>
         left.id.localeCompare(right.id),
       )) {
-        if (this.operationLocks === undefined) break;
         try {
           taskLocks.push(await this.operationLocks.acquire(`task-operation:${task.id}`));
         } catch (error) {
@@ -143,7 +153,7 @@ export class ProjectService implements ProjectManager {
       if (active !== undefined) {
         throw new OrchestratorError(`Project ${project.id} still has active task ${active.id}`, {
           code: "PROJECT",
-          nextCommand: `cxo task cancel ${active.id}`,
+          nextCommand: `cxo task status ${active.id}`,
         });
       }
       const taskWithWorktree = tasks?.find((task) => task.worktree !== undefined);
@@ -152,7 +162,7 @@ export class ProjectService implements ProjectManager {
           `Project ${project.id} still owns task worktree ${taskWithWorktree.id}`,
           {
             code: "PROJECT",
-            nextCommand: `cxo task cleanup ${taskWithWorktree.id} --remove-worktree`,
+            nextCommand: `cxo task status ${taskWithWorktree.id}`,
           },
         );
       }

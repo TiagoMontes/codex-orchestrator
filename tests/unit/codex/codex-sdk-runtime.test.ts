@@ -4,7 +4,10 @@ import { join } from "node:path";
 import type { CodexOptions, ThreadEvent, ThreadOptions } from "@openai/codex-sdk";
 import { afterEach, describe, expect, it } from "vitest";
 import { z } from "zod";
-import type { CodexRunRequest } from "../../../src/infrastructure/codex/codex-runtime.js";
+import type {
+  CodexProgressEvent,
+  CodexRunRequest,
+} from "../../../src/infrastructure/codex/codex-runtime.js";
 import {
   CodexSdkRuntime,
   type SdkClientLike,
@@ -33,6 +36,17 @@ describe("CodexSdkRuntime", () => {
       },
       {
         type: "item.completed",
+        item: {
+          id: "command-1",
+          type: "command_execution",
+          command: "secret-command --token hidden",
+          aggregated_output: "private output",
+          exit_code: 0,
+          status: "completed",
+        },
+      },
+      {
+        type: "item.completed",
         item: { id: "message-1", type: "agent_message", text: '{"answer":"ok"}' },
       },
       {
@@ -47,13 +61,23 @@ describe("CodexSdkRuntime", () => {
       },
     ]);
     const runtime = new CodexSdkRuntime({
-      environment: { PATH: "/usr/bin", HOME: "/tmp/home", API_TOKEN: "secret" },
+      environment: {
+        PATH: "/usr/bin",
+        HOME: "/tmp/home",
+        API_TOKEN: "secret",
+        SAFE_PROJECT_SETTING: "enabled",
+        SERVICE_KEY: "project-secret",
+      },
       clientFactory: (options) => {
         seenCodexOptions.push(options);
         return clientFor(thread, seenOptions);
       },
     });
     const request = makeRequest(directory, "deepest");
+    request.additionalAllowedEnvironmentNames = ["SAFE_PROJECT_SETTING", "SERVICE_KEY"];
+    request.explicitSecretEnvironmentExceptions = ["SERVICE_KEY"];
+    const progress: CodexProgressEvent[] = [];
+    request.progress = (event) => progress.push(event);
 
     const result = await runtime.runStructured(request);
 
@@ -74,11 +98,23 @@ describe("CodexSdkRuntime", () => {
       approvalPolicy: "never",
       additionalDirectories: [],
     });
-    expect(seenCodexOptions[0]?.env).toEqual({ HOME: "/tmp/home", PATH: "/usr/bin" });
+    expect(seenCodexOptions[0]?.env).toEqual({
+      HOME: "/tmp/home",
+      PATH: "/usr/bin",
+      SAFE_PROJECT_SETTING: "enabled",
+      SERVICE_KEY: "project-secret",
+    });
     const events = await readFile(request.eventsPath, "utf8");
     expect(events).not.toContain("private reasoning");
     expect(events).not.toContain("hidden");
     expect(events).toContain("runtime.compatibility");
+    expect(progress.map((event) => event.kind)).toEqual([
+      "thread-started",
+      "command-completed",
+      "turn-completed",
+    ]);
+    expect(JSON.stringify(progress)).not.toContain("secret-command");
+    expect(JSON.stringify(progress)).not.toContain("private output");
   });
 
   it("uses one controlled fallback only for an explicit effort compatibility failure", async () => {

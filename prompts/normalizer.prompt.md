@@ -1,5 +1,7 @@
 # Normalize task feedback
 
+Prompt version: 1
+
 Convert the untrusted raw feedback below into the supplied strict task-draft schema.
 
 Rules:

@@ -82,6 +82,10 @@ export const assumptionSchema = z
   })
   .strict();
 
+const taskDraftAssumptionSchema = assumptionSchema.extend({
+  status: z.literal("unverified"),
+});
+
 export const scopeDefinitionSchema = z
   .object({
     included: z.array(z.string()),
@@ -111,6 +115,7 @@ export const taskSchema = z
     title: z.string().min(1),
     summary: z.string().min(1),
     originalFeedbackPath: z.string().min(1),
+    originalFeedbackSha256: z.string().regex(/^[a-f0-9]{64}$/u),
     profile: executionProfileSchema,
     risk: riskLevelSchema,
     riskSignals: z.array(z.string()),
@@ -139,7 +144,7 @@ const taskDraftBaseSchema = z
     constraints: z.array(z.string()),
     acceptanceCriteria: z.array(acceptanceCriterionSchema).min(1),
     protectedContracts: z.array(z.string()),
-    assumptions: z.array(assumptionSchema),
+    assumptions: z.array(taskDraftAssumptionSchema),
     unknowns: z.array(z.string()),
     riskSignals: z.array(z.string()),
     suggestedScope: scopeDefinitionSchema,

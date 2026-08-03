@@ -20,6 +20,7 @@ const project: Project = {
     { path: "/tmp/demo/AGENTS.md", relativePath: "AGENTS.md", sha256: "b".repeat(64) },
   ],
   skillMetadata: [],
+  environmentPolicy: { allowlist: [], secretExceptions: [] },
   verificationPolicy: { focused: [], full: [], candidates: [] },
   createdAt: timestamp,
   updatedAt: timestamp,
@@ -34,6 +35,7 @@ const task: Task = {
   title: "Bug",
   summary: "Fix bug",
   originalFeedbackPath: "/tmp/state/original.md",
+  originalFeedbackSha256: "a".repeat(64),
   profile: "balanced",
   risk: "medium",
   riskSignals: [],
@@ -103,6 +105,11 @@ describe("ContextPackBuilder and integrity", () => {
     expect(pack.evidence).toHaveLength(1);
     expect(pack.evidence[0]?.excerpt).toHaveLength(DEFAULT_CONFIG.context.maxExcerptCharacters);
     expect(pack.relevantFiles).toEqual(["src/a.ts"]);
+    expect(pack.taskBrief).toMatchObject({
+      title: "Bug",
+      summary: "Fix bug",
+      reports: [{ currentBehavior: "broken", expectedBehavior: ["works"] }],
+    });
     expect(pack).not.toHaveProperty("logs");
     expect(pack).not.toHaveProperty("conversationHistory");
     expect(() =>

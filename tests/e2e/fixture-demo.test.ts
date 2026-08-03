@@ -16,6 +16,8 @@ import type {
 import { DiffService } from "../../src/infrastructure/git/diff-service.js";
 import { StatePaths } from "../../src/infrastructure/persistence/state-paths.js";
 import { VerificationFileRepository } from "../../src/infrastructure/persistence/verification-file-repository.js";
+import { verificationPolicyHash } from "../../src/application/tasks/verification-policy.js";
+import { projectSchema } from "../../src/domain/project/project.js";
 
 const temporaryDirectories: string[] = [];
 const feedbackPath = join(process.cwd(), "tests", "fixtures", "feedback.md");
@@ -128,6 +130,37 @@ describe("required fixture demonstration", () => {
       await invoke(["--json", "project", "add", repositoryRoot, "--name", "demo"]),
     );
     expect(project).toMatchObject({ id: "demo", gitRoot: repositoryRoot });
+    const projectConfigPath = join(paths.projectDirectory("demo"), "project-config.yaml");
+    const editedProjectConfig = `schemaVersion: 1
+projectId: demo
+verification:
+  focused:
+    - name: edited-bet-regression
+      command: [node, --test, test/bet-service.test.js]
+      timeoutSeconds: 90
+      source: fixture-edited
+      approved: true
+  full: []
+  candidates: []
+`;
+    await writeFile(projectConfigPath, editedProjectConfig, "utf8");
+    const configuredProject = parseJson(await invoke(["--json", "project", "inspect", "demo"]));
+    expect(configuredProject).toMatchObject({
+      verificationPolicy: {
+        focused: [
+          {
+            name: "edited-bet-regression",
+            argv: ["node", "--test", "test/bet-service.test.js"],
+            approved: true,
+          },
+        ],
+      },
+    });
+    const refreshedProject = parseJson(await invoke(["--json", "project", "refresh", "demo"]));
+    expect(refreshedProject).toMatchObject({
+      project: { verificationPolicy: objectAt(configuredProject, "verificationPolicy") },
+    });
+    expect(await readFile(projectConfigPath, "utf8")).toBe(editedProjectConfig);
     const audit = parseJson(await invoke(["--json", "project", "audit", "demo"]));
     expect(audit).toMatchObject({ manifest: { sourceCommit, stale: false } });
     const created = parseJson(
@@ -147,10 +180,35 @@ describe("required fixture demonstration", () => {
     const run = parseJson(await invoke(["--json", "task", "run", taskId]));
     expect(run).toMatchObject({
       task: { status: "reviewing" },
-      verification: { overallStatus: "passed", sourceCommit },
+      verification: {
+        overallStatus: "passed",
+        sourceCommit,
+        commands: [
+          {
+            name: "edited-bet-regression",
+            argv: ["node", "--test", "test/bet-service.test.js"],
+          },
+        ],
+      },
     });
+    expect(objectAt(run, "verification").policyHash).toBe(
+      verificationPolicyHash(projectSchema.parse(configuredProject)),
+    );
     const review = parseJson(await invoke(["--json", "task", "review", taskId]));
-    expect(review).toMatchObject({ task: { status: "completed" } });
+    expect(review).toMatchObject({
+      task: { status: "completed" },
+      finalReport: {
+        task: { id: taskId, status: "completed" },
+        state: { status: "completed" },
+        artifacts: {
+          diagnosis: { status: "confirmed" },
+          diff: { changedFiles: ["src/bet-service.js", "test/bet-service.test.js"] },
+          verification: { overallStatus: "passed" },
+          review: { verdict: "approve" },
+        },
+        integrity: { artifactRelationshipsValid: true, liveDiffCurrent: true },
+      },
+    });
     const inspected = parseJson(await invoke(["--json", "task", "inspect", taskId]));
     expect(inspected).toMatchObject({ id: taskId, status: "completed" });
     const diff = parseJson(await invoke(["--json", "task", "diff", taskId, "--patch"]));
@@ -201,10 +259,10 @@ describe("required fixture demonstration", () => {
     expect(requests.map((request) => request.threadId).length).toBe(
       new Set(requests.map((request) => request.threadId)).size,
     );
-    expect(requests.find((request) => request.role === "diagnostician")).toMatchObject({
-      sandbox: "read-only",
-      workingDirectory: repositoryRoot,
-    });
+    const diagnosisRequest = requests.find((request) => request.role === "diagnostician");
+    expect(diagnosisRequest).toMatchObject({ sandbox: "read-only" });
+    expect(diagnosisRequest?.workingDirectory).not.toBe(repositoryRoot);
+    expect(diagnosisRequest?.workingDirectory).toContain(`${taskId}-diagnosis-`);
     expect(requests.find((request) => request.role === "implementer")).toMatchObject({
       sandbox: "workspace-write",
       workingDirectory: worktreePath,

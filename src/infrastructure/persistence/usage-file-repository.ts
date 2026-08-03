@@ -4,6 +4,7 @@ import { join } from "node:path";
 import type { Clock } from "../../shared/clock.js";
 import { isoNow, systemClock } from "../../shared/clock.js";
 import { OrchestratorError } from "../../shared/errors.js";
+import { stableJson } from "../../shared/hashing.js";
 import type { ExecutionPhase } from "../../domain/execution/execution.js";
 import type { NormalizedUsage } from "../../domain/usage/usage.js";
 import { ZERO_ESTIMATED_USAGE } from "../../domain/usage/usage.js";
@@ -98,6 +99,57 @@ export class UsageFileRepository {
       const ledger = await this.readOrCreate(input.projectId, input.taskId);
       const reservation = ledger.reservations.find((item) => item.id === input.reservationId);
       if (reservation === undefined) {
+        const committed = ledger.entries.find(
+          (entry) => entry.reservationId === input.reservationId,
+        );
+        if (committed !== undefined) {
+          if (
+            committed.model !== input.model ||
+            committed.reasoning !== input.reasoning ||
+            (!(committed.usage.source === "estimated" && input.usage.source === "actual") &&
+              (committed.threadId ?? null) !== (input.threadId ?? null))
+          ) {
+            throw new OrchestratorError("Repeated usage commit metadata does not match", {
+              code: "CONTEXT_INTEGRITY",
+            });
+          }
+          if (committed.usage.source === "estimated" && input.usage.source === "actual") {
+            if ((input.agentCalls ?? 1) > committed.agentCalls) {
+              throw new OrchestratorError("Actual agent calls exceed the recovered reservation", {
+                code: "BUDGET",
+              });
+            }
+            const upgraded: UsageLedgerEntry = {
+              ...committed,
+              model: input.model,
+              reasoning: input.reasoning,
+              ...(input.threadId === undefined ? {} : { threadId: input.threadId }),
+              agentCalls: input.agentCalls ?? committed.agentCalls,
+              usage: input.usage,
+              recordedAt: isoNow(this.clock),
+            };
+            ledger.entries = ledger.entries.map((entry) =>
+              entry.id === committed.id ? upgraded : entry,
+            );
+            ledger.totalCalls = ledger.entries.reduce(
+              (total, entry) => total + entry.agentCalls,
+              0,
+            );
+            ledger.totals = addUsage(ledger.entries.map((entry) => entry.usage));
+            ledger.updatedAt = isoNow(this.clock);
+            await this.write(input.projectId, input.taskId, ledger);
+            return upgraded;
+          }
+          if (
+            committed.agentCalls !== (input.agentCalls ?? 1) ||
+            stableJson(committed.usage) !== stableJson(input.usage)
+          ) {
+            throw new OrchestratorError("Repeated actual usage commit does not match", {
+              code: "CONTEXT_INTEGRITY",
+            });
+          }
+          return committed;
+        }
         throw new OrchestratorError(`Usage reservation not found: ${input.reservationId}`, {
           code: "BUDGET",
         });
@@ -110,6 +162,7 @@ export class UsageFileRepository {
       }
       const entry: UsageLedgerEntry = {
         id: randomUUID(),
+        reservationId: reservation.id,
         phase: reservation.phase,
         model: input.model,
         reasoning: input.reasoning,
@@ -142,6 +195,71 @@ export class UsageFileRepository {
       ledger.reservations = ledger.reservations.filter((item) => item.id !== reservationId);
       ledger.updatedAt = isoNow(this.clock);
       await this.write(projectId, taskId, ledger);
+    } finally {
+      await lock.release();
+    }
+  }
+
+  async commitFailedReservation(input: {
+    projectId: string;
+    taskId: string;
+    reservationId: string;
+    model: string;
+    reasoning: ReasoningPreset;
+    threadId?: string;
+  }): Promise<UsageLedgerEntry> {
+    const lock = await this.locks.acquire(`usage:${input.taskId}`);
+    try {
+      const ledger = await this.readOrCreate(input.projectId, input.taskId);
+      const reservation = ledger.reservations.find((item) => item.id === input.reservationId);
+      if (reservation === undefined) {
+        const committed = ledger.entries.find(
+          (entry) => entry.reservationId === input.reservationId,
+        );
+        if (committed !== undefined) {
+          if (
+            committed.model !== input.model ||
+            committed.reasoning !== input.reasoning ||
+            (input.threadId !== undefined && committed.threadId !== input.threadId)
+          ) {
+            throw new OrchestratorError("Repeated failed usage commit does not match", {
+              code: "CONTEXT_INTEGRITY",
+            });
+          }
+          return committed;
+        }
+        throw new OrchestratorError(`Usage reservation not found: ${input.reservationId}`, {
+          code: "BUDGET",
+        });
+      }
+      const usage: NormalizedUsage = {
+        inputTokens: reservation.projectedTokens,
+        cachedInputTokens: 0,
+        cacheWriteInputTokens: 0,
+        outputTokens: 0,
+        reasoningOutputTokens: 0,
+        totalTokens: reservation.projectedTokens,
+        source: "estimated",
+      };
+      const entry: UsageLedgerEntry = {
+        id: randomUUID(),
+        reservationId: reservation.id,
+        phase: reservation.phase,
+        model: input.model,
+        reasoning: input.reasoning,
+        ...(input.threadId === undefined ? {} : { threadId: input.threadId }),
+        ...(reservation.workerId === undefined ? {} : { workerId: reservation.workerId }),
+        agentCalls: reservation.projectedCalls,
+        usage,
+        recordedAt: isoNow(this.clock),
+      };
+      ledger.reservations = ledger.reservations.filter((item) => item.id !== reservation.id);
+      ledger.entries.push(entry);
+      ledger.totalCalls += reservation.projectedCalls;
+      ledger.totals = addUsage(ledger.entries.map((item) => item.usage));
+      ledger.updatedAt = isoNow(this.clock);
+      await this.write(input.projectId, input.taskId, ledger);
+      return entry;
     } finally {
       await lock.release();
     }

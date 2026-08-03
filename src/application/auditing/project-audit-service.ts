@@ -16,8 +16,12 @@ import {
   type KnowledgeManifest,
 } from "../../domain/audit/audit-artifacts.js";
 import type { NormalizedUsage } from "../../domain/usage/usage.js";
-import type { CodexRuntime } from "../../infrastructure/codex/codex-runtime.js";
-import { GitClient } from "../../infrastructure/git/git-client.js";
+import type {
+  CodexProgressObserver,
+  CodexRuntime,
+} from "../../infrastructure/codex/codex-runtime.js";
+import type { GitClient } from "../../infrastructure/git/git-client.js";
+import { GitClientFactory } from "../../infrastructure/git/git-client-factory.js";
 import {
   artifactHashes,
   type AuditArtifactRepository,
@@ -28,11 +32,13 @@ import { PromptLoader } from "../../prompts/prompt-loader.js";
 import type { Clock } from "../../shared/clock.js";
 import { isoNow, systemClock } from "../../shared/clock.js";
 import { OrchestratorError } from "../../shared/errors.js";
-import { sha256, stableJson } from "../../shared/hashing.js";
+import { hashJson, sha256, stableJson } from "../../shared/hashing.js";
 import { ContextSizer } from "../../orchestration/context/context-sizer.js";
+import { assertStructuredOutputBounded } from "../../orchestration/context/structured-output-bound.js";
 import { ModelRouter } from "../../orchestration/routing/model-router.js";
 import type { ProjectRefresher } from "./project-refresh-service.js";
 import { SkillRegistry } from "../skills/skill-registry.js";
+import { FileLockManager } from "../../infrastructure/persistence/file-lock.js";
 
 export type ProjectAuditOverrides = {
   profile?: ExecutionProfile;
@@ -43,6 +49,7 @@ export type ProjectAuditOverrides = {
   parallelReaders?: number;
   allowNetwork?: boolean;
   timeoutMs?: number;
+  progress?: CodexProgressObserver;
   abortSignal?: AbortSignal;
 };
 
@@ -58,10 +65,11 @@ export interface ProjectAuditor {
 }
 
 export class ProjectAuditService implements ProjectAuditor {
-  private readonly git = new GitClient();
+  private readonly gitClients: GitClientFactory;
   private readonly promptLoader = new PromptLoader();
   private readonly store = new AtomicJsonStore();
   private readonly skillRegistry = new SkillRegistry();
+  private readonly operationLocks: FileLockManager;
 
   constructor(
     private readonly configService: ConfigService,
@@ -70,24 +78,44 @@ export class ProjectAuditService implements ProjectAuditor {
     private readonly runtime: CodexRuntime,
     private readonly repository: AuditArtifactRepository,
     private readonly clock: Clock = systemClock,
-  ) {}
+  ) {
+    this.operationLocks = new FileLockManager(paths.locksDirectory);
+    this.gitClients = new GitClientFactory(paths);
+  }
 
   async audit(
     reference: string,
     overrides: ProjectAuditOverrides = {},
   ): Promise<ProjectAuditReport> {
+    const initial = await this.refresher.refresh(reference);
+    const lock = await this.operationLocks.acquire(`project-operation:${initial.project.id}`);
+    try {
+      return await this.auditLocked(initial.project.id, overrides);
+    } finally {
+      await lock.release();
+    }
+  }
+
+  private async auditLocked(
+    reference: string,
+    overrides: ProjectAuditOverrides,
+  ): Promise<ProjectAuditReport> {
     const config = await this.configService.load();
-    const refreshed = await this.refresher.refresh(reference);
+    const refreshed = await this.refresher.refresh(reference, { skipOperationLock: true });
     const project = refreshed.project;
-    const sourceCommit = await this.git.resolveCommit(project.gitRoot, "HEAD");
-    const beforeStatus = await this.git.statusPorcelain(project.gitRoot);
+    const correlation: { phase: string; executionId?: string; threadId?: string } = {
+      phase: "audit",
+    };
+    const git = this.gitClients.project(project.id, correlation);
+    const sourceCommit = await git.resolveCommit(project.gitRoot, "HEAD");
+    const beforeStatus = await git.statusPorcelain(project.gitRoot);
     if (beforeStatus !== "") {
       throw new OrchestratorError(
         "Repository audit requires a clean checkout so every claim is commit-scoped",
         { code: "CONTEXT_INTEGRITY" },
       );
     }
-    const allTrackedFiles = await this.git.listFilesAtCommit(project.gitRoot, sourceCommit);
+    const allTrackedFiles = await git.listFilesAtCommit(project.gitRoot, sourceCommit);
     const trackedFiles = allTrackedFiles.slice(0, 5_000);
     const selectedSkills = await this.skillRegistry.select({ phase: "audit", project });
     const auditContext = {
@@ -133,6 +161,7 @@ export class ProjectAuditService implements ProjectAuditor {
       },
     });
     const auditRunId = randomUUID();
+    correlation.executionId = auditRunId;
     const eventsPath = join(
       this.paths.knowledgeDirectory(project.id),
       "audit-runs",
@@ -156,13 +185,18 @@ export class ProjectAuditService implements ProjectAuditor {
       outputValidator: auditAgentResultSchema,
       timeoutMs: overrides.timeoutMs ?? config.runtime.defaultTimeoutSeconds * 1_000,
       eventsPath,
+      additionalAllowedEnvironmentNames: project.environmentPolicy.allowlist,
+      explicitSecretEnvironmentExceptions: project.environmentPolicy.secretExceptions,
+      ...(overrides.progress === undefined ? {} : { progress: overrides.progress }),
       ...(overrides.abortSignal === undefined ? {} : { abortSignal: overrides.abortSignal }),
     });
+    correlation.threadId = runtimeResult.threadId;
     if (runtimeResult.runtimeAttempts > limits.maxAgentCalls) {
       throw new OrchestratorError("Audit runtime exceeded its admitted call count", {
         code: "BUDGET",
       });
     }
+    assertStructuredOutputBounded(runtimeResult.output, config);
     const output = auditAgentResultSchema.parse(runtimeResult.output);
     if (output.projectId !== project.id || output.sourceCommit !== sourceCommit) {
       throw new OrchestratorError("Audit output identity mismatch", {
@@ -175,11 +209,12 @@ export class ProjectAuditService implements ProjectAuditor {
       sourceCommit,
       trackedFiles,
       config,
+      git,
     );
     assertEvidenceLinks(output, evidence);
     if (
-      (await this.git.resolveCommit(project.gitRoot, "HEAD")) !== sourceCommit ||
-      (await this.git.statusPorcelain(project.gitRoot)) !== beforeStatus
+      (await git.resolveCommit(project.gitRoot, "HEAD")) !== sourceCommit ||
+      (await git.statusPorcelain(project.gitRoot)) !== beforeStatus
     ) {
       throw new OrchestratorError("Repository changed during its read-only audit", {
         code: "CONTEXT_INTEGRITY",
@@ -222,6 +257,7 @@ export class ProjectAuditService implements ProjectAuditor {
       projectId: project.id,
       sourceCommit,
       currentHeadCommit: sourceCommit,
+      verificationPolicyHash: hashJson(project.verificationPolicy),
       instructionHashes: project.instructionFiles.map((item) => ({
         path: item.relativePath,
         sha256: item.sha256,
@@ -282,6 +318,7 @@ export class ProjectAuditService implements ProjectAuditor {
     sourceCommit: string,
     trackedFiles: readonly string[],
     config: AppConfig,
+    git: GitClient,
   ): Promise<KnowledgeEvidenceReference[]> {
     if (output.evidenceReferences.length > config.context.maxEvidenceItems) {
       throw new OrchestratorError("Audit returned too many evidence items", { code: "BUDGET" });
@@ -316,7 +353,7 @@ export class ProjectAuditService implements ProjectAuditor {
           code: "CONTEXT_INTEGRITY",
         });
       }
-      const contents = await this.git.showFileAtCommit(gitRoot, sourceCommit, item.file);
+      const contents = await git.showFileAtCommit(gitRoot, sourceCommit, item.file);
       const lines = contents.split(/\r?\n/u);
       const startLine = item.startLine ?? 1;
       const endLine = item.endLine ?? Math.min(Math.max(lines.length, 1), startLine + 19);

@@ -1,4 +1,5 @@
 import { access, mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -98,4 +99,122 @@ describe("CommandRunner", () => {
     await expect(access(marker)).rejects.toBeDefined();
     expect(await readFile(result.logPath, "utf8")).toContain("command skipped");
   });
+
+  it("contains filesystem writes and disables network while allowing worktree-local output", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cxo-command-containment-"));
+    const workspace = join(root, "workspace");
+    await import("node:fs/promises").then(({ mkdir }) => mkdir(workspace));
+    temporaryDirectories.push(root);
+    const outsideMarker = join(root, "outside-marker");
+    const outsideSecret = join(root, "outside-secret");
+    const localMarker = join(workspace, "local-marker");
+    await import("node:fs/promises").then(({ writeFile }) =>
+      writeFile(outsideSecret, "credential-canary", "utf8"),
+    );
+    const runner = new CommandRunner(DEFAULT_CONFIG);
+
+    const local = await runner.run({
+      argv: [
+        process.execPath,
+        "-e",
+        `require("node:fs").writeFileSync(${JSON.stringify(localMarker)}, "ok")`,
+      ],
+      cwd: workspace,
+      timeoutMs: 5_000,
+      logPath: join(root, "local.log"),
+    });
+    const outside = await runner.run({
+      argv: [
+        process.execPath,
+        "-e",
+        `require("node:fs").writeFileSync(${JSON.stringify(outsideMarker)}, "bad")`,
+      ],
+      cwd: workspace,
+      timeoutMs: 5_000,
+      logPath: join(root, "outside.log"),
+    });
+    const readOutside = await runner.run({
+      argv: [
+        process.execPath,
+        "-e",
+        `try{require("node:fs").readFileSync(${JSON.stringify(outsideSecret)});process.exit(42)}catch{process.exit(0)}`,
+      ],
+      cwd: workspace,
+      timeoutMs: 5_000,
+      logPath: join(root, "outside-read.log"),
+    });
+
+    const server = createServer();
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (address === null || typeof address === "string") throw new Error("missing TCP address");
+    try {
+      const network = await runner.run({
+        argv: [
+          process.execPath,
+          "-e",
+          `const s=require("node:net").connect(${address.port},"127.0.0.1");s.once("connect",()=>process.exit(42));s.once("error",()=>process.exit(0));setTimeout(()=>process.exit(43),1000)`,
+        ],
+        cwd: workspace,
+        timeoutMs: 5_000,
+        logPath: join(root, "network.log"),
+      });
+      expect(network.exitCode).toBe(0);
+      expect(network.sandboxError).toBeUndefined();
+    } finally {
+      server.close();
+    }
+
+    expect(local.exitCode).toBe(0);
+    expect(local.sandboxError).toBeUndefined();
+    expect(outside.exitCode).not.toBe(0);
+    expect(readOutside.exitCode).toBe(0);
+    expect(await readFile(localMarker, "utf8")).toBe("ok");
+    await expect(access(outsideMarker)).rejects.toBeDefined();
+  });
+
+  it("terminates the command process group before a descendant can outlive a timeout", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "cxo-command-tree-"));
+    temporaryDirectories.push(directory);
+    const marker = join(directory, "late-child-marker");
+    const result = await new CommandRunner(DEFAULT_CONFIG).run({
+      argv: [
+        process.execPath,
+        "-e",
+        `require("node:child_process").spawn(process.execPath,["-e",${JSON.stringify(`process.on("SIGTERM",()=>{});setTimeout(()=>require("node:fs").writeFileSync(${JSON.stringify(marker)},"bad"),1500);setInterval(()=>{},1000)`)}],{stdio:"inherit"});setInterval(()=>{},1000)`,
+      ],
+      cwd: directory,
+      timeoutMs: 50,
+      logPath: join(directory, "tree.log"),
+    });
+    await new Promise((resolve) => setTimeout(resolve, 1_700));
+
+    expect(result.timedOut).toBe(true);
+    await expect(access(marker)).rejects.toBeDefined();
+  });
+
+  it.skipIf(process.platform !== "darwin")(
+    "settles at a hard deadline when a re-sessioned descendant keeps pipes open",
+    async () => {
+      const directory = await mkdtemp(join(tmpdir(), "cxo-command-session-"));
+      temporaryDirectories.push(directory);
+      const started = Date.now();
+      const result = await new CommandRunner(DEFAULT_CONFIG).run({
+        argv: [
+          process.execPath,
+          "-e",
+          'const child=require("node:child_process").spawn(process.execPath,["-e","setTimeout(()=>{},2300)"],{detached:true,stdio:"inherit"});child.unref()',
+        ],
+        cwd: directory,
+        timeoutMs: 50,
+        logPath: join(directory, "session.log"),
+      });
+
+      expect(Date.now() - started).toBeLessThan(3_000);
+      expect(result).toMatchObject({ timedOut: true, exitCode: null });
+      expect(result.signal).toMatch(/^SIG(?:TERM|KILL)$/u);
+      expect(result.sandboxError).toContain("hard deadline");
+    },
+    5_000,
+  );
 });

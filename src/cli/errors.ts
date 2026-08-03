@@ -12,6 +12,7 @@ export function handleCliError(
   options: CliErrorOutputOptions = {},
 ): number {
   const normalized = toOrchestratorError(error);
+  const nextCommand = normalized.nextCommand ?? safeFallbackCommand(normalized.code);
   if (options.json === true) {
     writer.writeError(
       JSON.stringify({
@@ -21,7 +22,7 @@ export function handleCliError(
           message: normalized.message,
           exitCode: normalized.exitCode,
           resumable: normalized.resumable,
-          ...(normalized.nextCommand === undefined ? {} : { nextCommand: normalized.nextCommand }),
+          nextCommand,
           ...(options.debug === true && normalized.stack !== undefined
             ? { stack: normalized.stack }
             : {}),
@@ -32,11 +33,25 @@ export function handleCliError(
   }
   writer.writeError(`Error: ${normalized.message}`);
   writer.writeError(`Resumable: ${normalized.resumable ? "yes" : "no"}`);
-  if (normalized.nextCommand !== undefined) {
-    writer.writeError(`Next safe command: ${normalized.nextCommand}`);
-  }
+  writer.writeError(`Next safe command: ${nextCommand}`);
   if (options.debug === true && normalized.stack !== undefined) {
     writer.writeError(normalized.stack);
   }
   return normalized.exitCode;
+}
+
+function safeFallbackCommand(code: ReturnType<typeof toOrchestratorError>["code"]): string {
+  switch (code) {
+    case "CLI_INPUT":
+    case "GENERIC":
+      return "cxo --help";
+    case "CONFIGURATION":
+      return "cxo config validate";
+    case "PROJECT":
+      return "cxo project list";
+    case "CODEX_RUNTIME":
+      return "cxo doctor";
+    default:
+      return "cxo task list";
+  }
 }

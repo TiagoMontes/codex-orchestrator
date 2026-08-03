@@ -5,6 +5,7 @@ import type { DeepDoctorProbe } from "../../application/doctor/doctor-types.js";
 import type { StatePaths } from "../persistence/state-paths.js";
 import { EnvironmentSanitizer } from "../process/environment-sanitizer.js";
 import { LogRedactor } from "../process/log-redactor.js";
+import { GitClientFactory } from "../git/git-client-factory.js";
 
 export class CliDeepDoctorProbe implements DeepDoctorProbe {
   constructor(
@@ -17,14 +18,9 @@ export class CliDeepDoctorProbe implements DeepDoctorProbe {
     await this.paths.ensureBaseDirectories();
     const repository = await mkdtemp(join(this.paths.tempDirectory, "doctor-codex-"));
     try {
-      const initialized = await execa("git", ["init", "--quiet"], {
-        cwd: repository,
-        reject: false,
-        timeout: 10_000,
-      });
-      if (initialized.exitCode !== 0) {
-        throw new Error("Unable to create the temporary doctor repository");
-      }
+      await new GitClientFactory(this.paths)
+        .global({ phase: "doctor-deep" })
+        .initializeEmptyRepository(repository);
 
       const environment = this.sanitizer.sanitize(process.env).environment;
       const result = await execa(

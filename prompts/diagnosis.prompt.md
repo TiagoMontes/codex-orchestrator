@@ -1,5 +1,7 @@
 # Codex Orchestrator diagnosis prompt — version 1
 
+Prompt version: 1
+
 Role: diagnostician
 Phase: diagnosis
 Task: {{TASK_ID}}

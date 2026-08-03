@@ -3,7 +3,7 @@ import type { VerificationFileRepository } from "../../infrastructure/persistenc
 import type { TaskFileRepository } from "../../infrastructure/persistence/task-file-repository.js";
 import type { ProjectManager } from "../projects/project-service.js";
 import { DiffService } from "../../infrastructure/git/diff-service.js";
-import { GitClient } from "../../infrastructure/git/git-client.js";
+import { GitClientFactory } from "../../infrastructure/git/git-client-factory.js";
 import { WorktreeManager } from "../../infrastructure/git/worktree-manager.js";
 import type { StatePaths } from "../../infrastructure/persistence/state-paths.js";
 import type { Task, TaskStatus } from "../../domain/task/task.js";
@@ -15,6 +15,8 @@ import { TaskStateMachine } from "../../orchestration/engine/state-machine.js";
 import { FileLockManager } from "../../infrastructure/persistence/file-lock.js";
 import type { UsageFileRepository } from "../../infrastructure/persistence/usage-file-repository.js";
 import type { ExecutionFileRepository } from "../../infrastructure/persistence/execution-file-repository.js";
+import { verificationPolicyHash } from "./verification-policy.js";
+import { recoverInterruptedUsage } from "./interrupted-usage-recovery.js";
 
 export type TaskControlReport = {
   task: Task;
@@ -34,7 +36,7 @@ export interface TaskNormalizationResumer {
 
 export class TaskControlService implements TaskController {
   private readonly stateMachine = new TaskStateMachine();
-  private readonly git = new GitClient();
+  private readonly gitClients: GitClientFactory;
   private readonly operationLocks: FileLockManager;
 
   constructor(
@@ -49,12 +51,12 @@ export class TaskControlService implements TaskController {
     private readonly executions?: ExecutionFileRepository,
   ) {
     this.operationLocks = new FileLockManager(paths.locksDirectory);
+    this.gitClients = new GitClientFactory(paths);
   }
 
   async cancel(taskId: string): Promise<TaskControlReport> {
     for (let attempt = 0; attempt < 3; attempt += 1) {
-      const task = await this.tasks.get(taskId);
-      const state = await this.tasks.getState(taskId);
+      const { task, state } = await this.tasks.getSnapshot(taskId);
       assertSynchronized(task, state);
       if (state.status === "cancelled") {
         return { task, state, nextCommand: `cxo task resume ${taskId}`, idempotent: true };
@@ -79,7 +81,27 @@ export class TaskControlService implements TaskController {
   }
 
   async resume(taskId: string): Promise<TaskControlReport> {
-    const initialState = await this.tasks.getState(taskId);
+    let initialState = await this.tasks.getState(taskId);
+    if (initialState.status === "normalizing") {
+      const operationLock = await this.operationLocks.acquire(`task-operation:${taskId}`);
+      try {
+        const snapshot = await this.tasks.getSnapshot(taskId);
+        const task = snapshot.task;
+        initialState = snapshot.state;
+        if (initialState.status === "normalizing") {
+          const recovered = await this.transition(
+            task,
+            initialState,
+            "blocked",
+            "Recovered an interrupted normalization after its operation lock was released",
+            {},
+          );
+          initialState = recovered.state;
+        }
+      } finally {
+        await operationLock.release();
+      }
+    }
     if (
       (initialState.status === "blocked" || initialState.status === "cancelled") &&
       (initialState.resumableFrom === "normalizing" || initialState.resumableFrom === "created")
@@ -108,9 +130,27 @@ export class TaskControlService implements TaskController {
   }
 
   private async resumeLocked(taskId: string): Promise<TaskControlReport> {
-    const task = await this.tasks.get(taskId);
-    const state = await this.tasks.getState(taskId);
+    let { task, state } = await this.tasks.getSnapshot(taskId);
     assertSynchronized(task, state);
+    const interruptedActive = [
+      "diagnosing",
+      "worktree-preparing",
+      "implementing",
+      "verifying",
+      "reviewing",
+      "correcting",
+    ].includes(state.status);
+    if (interruptedActive) {
+      const interrupted = await this.transition(
+        task,
+        state,
+        "blocked",
+        `Recovered an interrupted ${state.status} phase after its operation lock was released`,
+        {},
+      );
+      task = interrupted.task;
+      state = interrupted.state;
+    }
     if (state.status !== "blocked" && state.status !== "cancelled") {
       throw new OrchestratorError(`Task ${taskId} cannot resume from ${state.status}`, {
         code: "TASK_STATE",
@@ -122,8 +162,8 @@ export class TaskControlService implements TaskController {
         code: "TASK_STATE",
       });
     }
+    await recoverInterruptedUsage(task, this.usage, this.executions);
     await this.reconcileInterruptedExecutions(task, state.status);
-    await this.usage?.releaseAllReservations(task.projectId, task.id);
     const target = resumeTarget(origin);
     const nextCommand = await this.assertResumeIntegrity(task, target);
     return this.transition(task, state, target, `User resumed task from ${origin}`, {
@@ -134,27 +174,31 @@ export class TaskControlService implements TaskController {
   private async assertResumeIntegrity(task: Task, target: TaskStatus): Promise<string> {
     if (target === "ready-for-diagnosis") return `cxo task diagnose ${task.id}`;
     const project = await this.projects.inspect(task.projectId);
+    const git = this.gitClients.task(project.id, task.id, { phase: "task-control" });
     const diagnosis = await this.diagnoses.read(project.id, task.id);
-    const primaryHead = await this.git.resolveCommit(project.gitRoot, "HEAD");
+    const resolvedBase =
+      task.baseCommit === undefined
+        ? undefined
+        : await git.resolveCommit(project.gitRoot, task.baseCommit);
     if (
       task.baseCommit === undefined ||
       diagnosis.sourceCommit !== task.baseCommit ||
-      primaryHead !== diagnosis.sourceCommit
+      resolvedBase !== diagnosis.sourceCommit
     ) {
-      throw new OrchestratorError("Task source changed; refresh and rediagnose before resuming", {
+      throw new OrchestratorError("Task source commit is unavailable or inconsistent", {
         code: "CONTEXT_INTEGRITY",
         resumable: true,
       });
     }
     if (task.worktree !== undefined) {
-      const manager = new WorktreeManager(this.paths, this.git);
+      const manager = new WorktreeManager(this.paths, git);
       const inspected = await manager.inspect(project.gitRoot, task.worktree.path);
       if (inspected.branch !== task.worktree.branch) {
         throw new OrchestratorError("Persisted worktree branch changed", {
           code: "CONTEXT_INTEGRITY",
         });
       }
-      if (!(await this.git.isAncestor(project.gitRoot, task.baseCommit, task.worktree.branch))) {
+      if (!(await git.isAncestor(project.gitRoot, task.baseCommit, task.worktree.branch))) {
         throw new OrchestratorError("Task base is not an ancestor of its worktree branch", {
           code: "CONTEXT_INTEGRITY",
         });
@@ -166,13 +210,15 @@ export class TaskControlService implements TaskController {
           code: "TASK_STATE",
         });
       }
-      const diff = await new DiffService(this.paths).read(project.id, task.id);
-      await new DiffService(this.paths).assertCurrent(diff, task.worktree.path);
+      const diffService = new DiffService(this.paths, git);
+      const diff = await diffService.read(project.id, task.id);
+      await diffService.assertCurrent(diff, task.worktree.path);
       const verification = await this.verification.read(project.id, task.id);
       if (
         verification.overallStatus !== "passed" ||
         verification.diffHash !== diff.diffHash ||
-        verification.sourceCommit !== diagnosis.sourceCommit
+        verification.sourceCommit !== diagnosis.sourceCommit ||
+        verification.policyHash !== verificationPolicyHash(project)
       ) {
         throw new OrchestratorError("Review resume requires current passing verification", {
           code: "CONTEXT_INTEGRITY",

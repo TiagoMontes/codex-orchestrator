@@ -6,6 +6,7 @@ import { reasoningPresetSchema } from "../../application/configuration/config-sc
 export const usageLedgerEntrySchema = z
   .object({
     id: z.string().uuid(),
+    reservationId: z.string().uuid().optional(),
     phase: executionPhaseSchema,
     model: z.string().min(1),
     reasoning: reasoningPresetSchema,

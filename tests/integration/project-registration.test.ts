@@ -1,7 +1,8 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { execa } from "execa";
 import { ProjectService } from "../../src/application/projects/project-service.js";
 import { ProjectRefreshService } from "../../src/application/auditing/project-refresh-service.js";
 import { DeterministicTaskNormalizer } from "../../src/application/tasks/deterministic-task-normalizer.js";
@@ -84,6 +85,9 @@ describe("project registration", () => {
     const configPath = join(stateHome, "projects", "demo", "project-config.yaml");
     const explicitConfig = `schemaVersion: 1
 projectId: demo
+environment:
+  allowlist: [SAFE_PROJECT_SETTING, SERVICE_KEY]
+  secretExceptions: [SERVICE_KEY]
 verification:
   focused:
     - name: focused-node-test
@@ -97,6 +101,10 @@ verification:
     await writeFile(configPath, explicitConfig, "utf8");
 
     await expect(service.inspect("demo")).resolves.toMatchObject({
+      environmentPolicy: {
+        allowlist: ["SAFE_PROJECT_SETTING", "SERVICE_KEY"],
+        secretExceptions: ["SERVICE_KEY"],
+      },
       verificationPolicy: {
         focused: [
           {
@@ -145,6 +153,100 @@ verification:
     await expect(service.inspect("demo")).rejects.toThrow("identity mismatch");
   });
 
+  it("rejects symlinked, non-regular, oversized, and credential-bearing project configuration", async () => {
+    const fixture = await mkdtemp(join(tmpdir(), "cxo-project-config-hardening-fixture-"));
+    const stateHome = await mkdtemp(join(tmpdir(), "cxo-project-config-hardening-state-"));
+    temporaryDirectories.push(fixture, stateHome);
+    await createGitFixture(fixture);
+    const paths = new StatePaths({ CODEX_ORCHESTRATOR_HOME: stateHome });
+    const service = new ProjectService(new ProjectFileRepository(paths));
+    await service.add({ path: fixture, name: "demo" });
+    const configPath = join(paths.projectDirectory("demo"), "project-config.yaml");
+
+    await rm(configPath);
+    await symlink(join(fixture, "package.json"), configPath);
+    await expect(service.inspect("demo")).rejects.toThrow("must be a regular file");
+
+    await rm(configPath);
+    await execa("mkfifo", [configPath]);
+    await expect(
+      Promise.race([
+        service.inspect("demo"),
+        new Promise((_, reject) => setTimeout(() => reject(new Error("FIFO read blocked")), 1_000)),
+      ]),
+    ).rejects.toThrow("must be a regular file");
+
+    await rm(configPath);
+    await writeFile(configPath, "x".repeat(1_048_577), "utf8");
+    await expect(service.inspect("demo")).rejects.toThrow("exceeds the 1 MiB limit");
+
+    await writeFile(
+      configPath,
+      `schemaVersion: 1
+projectId: demo
+verification:
+  focused:
+    - name: unsafe-secret
+      command: [tool, --token, plaintext-secret]
+      timeoutSeconds: 30
+      source: test
+      approved: true
+  full: []
+  candidates: []
+`,
+      "utf8",
+    );
+    await expect(service.inspect("demo")).rejects.toThrow("failed validation");
+
+    for (const [index, command] of [
+      ["curl", "-u", "alice:plaintext-secret"],
+      ["curl", "--header", "Authorization: Bearer plaintext-secret"],
+      ["tool", "--github-token=plaintext-secret"],
+      ["npm", "//registry.example.test/:_authToken=plaintext-secret"],
+      ["curl", "--proxy-user", "alice:plaintext-secret"],
+      ["curl", "-H", "X-Api-Key: plaintext-secret"],
+      ["git", "-c", "http.extraHeader=Authorization: Bearer plaintext-secret", "fetch"],
+    ].entries()) {
+      await writeFile(
+        configPath,
+        `schemaVersion: 1
+projectId: demo
+verification:
+  focused:
+    - name: unsafe-secret-${index}
+      command: ${JSON.stringify(command)}
+      timeoutSeconds: 30
+      source: test
+      approved: true
+  full: []
+  candidates: []
+`,
+        "utf8",
+      );
+      await expect(service.inspect("demo")).rejects.toThrow("failed validation");
+    }
+
+    await writeFile(
+      configPath,
+      `schemaVersion: 1
+projectId: demo
+verification:
+  focused:
+    - name: benign-suffix
+      command: [tool, --monkey, public]
+      timeoutSeconds: 30
+      source: test
+      approved: true
+  full: []
+  candidates: []
+`,
+      "utf8",
+    );
+    await expect(service.inspect("demo")).resolves.toMatchObject({
+      verificationPolicy: { focused: [{ argv: ["tool", "--monkey", "public"] }] },
+    });
+  });
+
   it("removes orchestrator state without deleting the target repository", async () => {
     const fixture = await mkdtemp(join(tmpdir(), "cxo-project-fixture-"));
     const stateHome = await mkdtemp(join(tmpdir(), "cxo-project-state-"));
@@ -191,7 +293,7 @@ verification:
     });
     const task = await tasks.get(created.task.id);
     const state = await tasks.getState(task.id);
-    const timestamp = "2026-08-02T12:10:00.000Z";
+    const timestamp = new Date(Date.parse(state.updatedAt) + 1_000).toISOString();
     const cancelled = new TaskStateMachine().transition(state, {
       nextState: "cancelled",
       timestamp,

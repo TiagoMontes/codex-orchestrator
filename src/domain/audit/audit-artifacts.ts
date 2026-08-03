@@ -232,6 +232,7 @@ export const knowledgeManifestSchema = z
     projectId: z.string().min(1),
     sourceCommit: z.string().min(1),
     currentHeadCommit: z.string().min(1),
+    verificationPolicyHash: z.string().regex(HASH).optional(),
     instructionHashes: z.array(
       z.object({ path: z.string().min(1), sha256: z.string().regex(HASH) }).strict(),
     ),

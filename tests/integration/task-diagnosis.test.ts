@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -353,7 +353,11 @@ describe("task diagnosis", () => {
     expect(maximumReaders).toBe(2);
     expect(roles.filter((role) => role === "read-worker")).toHaveLength(2);
     expect(roles.at(-1)).toBe("diagnostician");
-    expect(diagnosisPrompt).toContain("PW-report-1");
+    const workerEvidenceIds = report.evidence
+      .map((item) => item.id)
+      .filter((id) => id.startsWith("PW-"));
+    expect(workerEvidenceIds).toHaveLength(2);
+    expect(workerEvidenceIds.every((id) => diagnosisPrompt.includes(id))).toBe(true);
     expect(report.evidence).toHaveLength(3);
     expect((await usage.read("demo", created.task.id)).totalCalls).toBe(3);
     expect(
@@ -361,6 +365,179 @@ describe("task diagnosis", () => {
         (attempt) => attempt.phase === "exploration",
       ),
     ).toHaveLength(2);
+  });
+
+  it("diagnoses an older commit in a disposable worktree and runs only approved focused reproduction", async () => {
+    const fixture = await mkdtemp(join(tmpdir(), "cxo-detached-diagnosis-fixture-"));
+    const stateHome = await mkdtemp(join(tmpdir(), "cxo-detached-diagnosis-state-"));
+    temporaryDirectories.push(fixture, stateHome);
+    await createGitFixture(fixture);
+    const sourceCommit = await gitOutput(fixture, ["rev-parse", "HEAD"]);
+    await writeFile(join(fixture, "index.js"), "export const publicValue = 2;\n", "utf8");
+    await writeFile(
+      join(fixture, "test", "index.test.js"),
+      'import test from "node:test";\nimport assert from "node:assert/strict";\nimport { publicValue } from "../index.js";\ntest("public value", () => assert.equal(publicValue, 2));\n',
+      "utf8",
+    );
+    await gitOutput(fixture, ["add", "index.js", "test/index.test.js"]);
+    await gitOutput(fixture, ["commit", "-m", "feat: advance primary checkout"]);
+
+    const paths = new StatePaths({ CODEX_ORCHESTRATOR_HOME: stateHome });
+    const config = new ConfigService(paths);
+    await config.initialize();
+    const projects = new ProjectService(new ProjectFileRepository(paths));
+    await projects.add({ path: fixture, name: "demo" });
+    await writeFile(
+      join(paths.projectDirectory("demo"), "project-config.yaml"),
+      `schemaVersion: 1
+projectId: demo
+verification:
+  focused:
+    - name: approved-reproduction
+      command: [node, -e, "console.log('approved reproduction marker')"]
+      timeoutSeconds: 30
+      source: test-config
+      approved: true
+  full: []
+  candidates:
+    - name: unapproved-candidate
+      command: [node, -e, "console.log('candidate must not run')"]
+      timeoutSeconds: 30
+      source: detected
+      approved: false
+`,
+      "utf8",
+    );
+    await writeFile(join(fixture, "local-user-note.txt"), "preserve me\n", "utf8");
+    const primarySnapshot = {
+      head: await gitOutput(fixture, ["rev-parse", "HEAD"]),
+      status: await gitOutput(fixture, ["status", "--porcelain=v1", "--untracked-files=all"]),
+    };
+    const taskRepository = new TaskFileRepository(paths);
+    const created = await new TaskService(
+      paths,
+      taskRepository,
+      projects,
+      new DeterministicTaskNormalizer(),
+    ).create({
+      project: "demo",
+      feedback:
+        "# Diagnose the historical public value\n\nExpected behavior:\n- preserve version one\n",
+      profile: "balanced",
+    });
+    let workingDirectory = "";
+    let prompt = "";
+    const runtime: CodexRuntime = {
+      runStructured: async (request) => {
+        workingDirectory = request.workingDirectory;
+        prompt = request.prompt;
+        expect(await gitOutput(workingDirectory, ["rev-parse", "HEAD"])).toBe(sourceCommit);
+        expect(await readFile(join(workingDirectory, "index.js"), "utf8")).toContain("= 1");
+        const output = {
+          diagnosis: {
+            schemaVersion: 1,
+            taskId: created.task.id,
+            sourceCommit,
+            status: "confirmed",
+            reproduction: {
+              attempted: true,
+              reproduced: true,
+              steps: ["Ran the configured focused reproduction"],
+              blockers: [],
+              evidenceIds: [],
+            },
+            confirmedFacts: [{ statement: "The historical value is one", evidenceIds: ["H1"] }],
+            rootCauses: [
+              {
+                statement: "The behavior is commit-scoped",
+                confidence: "high",
+                evidenceIds: ["H1"],
+              },
+            ],
+            activeHypotheses: [],
+            rejectedHypotheses: [],
+            affectedFiles: [
+              {
+                path: "index.js",
+                reason: "Defines the historical value",
+                symbols: ["publicValue"],
+              },
+            ],
+            risks: [],
+            implementationPlan: [
+              {
+                id: "P1",
+                description: "Preserve historical behavior",
+                files: ["index.js"],
+                risk: "low",
+              },
+            ],
+            verificationPlan: [
+              {
+                id: "V1",
+                name: "node tests",
+                argv: ["node", "--test"],
+                expectedOutcome: "tests pass",
+              },
+            ],
+            nextAction: "Prepare a worktree from the historical commit",
+            createdAt: "2026-08-02T12:01:00.000Z",
+          },
+          evidence: [
+            {
+              id: "H1",
+              taskId: created.task.id,
+              kind: "file",
+              status: "confirmed",
+              statement: "index.js exports one at the requested commit",
+              sourceCommit,
+              file: "index.js",
+              startLine: 1,
+              endLine: 1,
+              observedAt: "2026-08-02T12:01:00.000Z",
+            },
+          ],
+        };
+        return agentResult(request, output, "detached-diagnosis-thread");
+      },
+    };
+    const diagnosis = new TaskDiagnosisService(
+      config,
+      paths,
+      taskRepository,
+      projects,
+      runtime,
+      new UsageFileRepository(paths),
+      new DiagnosisFileRepository(paths),
+      new EvidenceFileRepository(paths),
+      new ExecutionFileRepository(paths),
+      new DecisionFileRepository(paths),
+    );
+
+    const report = await diagnosis.diagnose(created.task.id, { baseRef: sourceCommit });
+
+    expect(workingDirectory).not.toBe(fixture);
+    expect(workingDirectory).toContain(`${created.task.id}-diagnosis-`);
+    expect(prompt).toContain("approved reproduction marker");
+    expect(prompt).not.toContain("candidate must not run");
+    expect(report.evidence.some((item) => item.statement.includes("approved-reproduction"))).toBe(
+      true,
+    );
+    expect(await gitOutput(fixture, ["rev-parse", "HEAD"])).toBe(primarySnapshot.head);
+    expect(await gitOutput(fixture, ["status", "--porcelain=v1", "--untracked-files=all"])).toBe(
+      primarySnapshot.status,
+    );
+    const worktreeList = await gitOutput(fixture, ["worktree", "list", "--porcelain"]);
+    expect(worktreeList.match(/^worktree /gmu)).toHaveLength(1);
+    const logs = await readdir(join(paths.taskDirectory("demo", created.task.id), "logs"));
+    const reproductionLog = logs.find((name) => name.startsWith("diagnosis-reproduction-"));
+    expect(reproductionLog).toBeDefined();
+    expect(
+      await readFile(
+        join(paths.taskDirectory("demo", created.task.id), "logs", reproductionLog!),
+        "utf8",
+      ),
+    ).toContain("approved reproduction marker");
   });
 });
 

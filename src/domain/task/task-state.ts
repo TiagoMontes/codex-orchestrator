@@ -1,5 +1,46 @@
 import { z } from "zod";
-import { taskStatusSchema } from "./task.js";
+import { taskStatusSchema, type TaskStatus } from "./task.js";
+
+export const allowedTaskTransitions: Readonly<Record<TaskStatus, readonly TaskStatus[]>> = {
+  created: ["normalizing", "blocked", "cancelled", "failed"],
+  normalizing: ["ready-for-diagnosis", "blocked", "failed", "cancelled"],
+  "ready-for-diagnosis": ["diagnosing", "blocked", "cancelled", "failed"],
+  diagnosing: ["diagnosed", "blocked", "failed", "cancelled"],
+  diagnosed: ["worktree-preparing", "blocked", "cancelled", "failed"],
+  "worktree-preparing": ["ready-for-implementation", "blocked", "failed", "cancelled"],
+  "ready-for-implementation": [
+    "worktree-preparing",
+    "implementing",
+    "blocked",
+    "cancelled",
+    "failed",
+  ],
+  implementing: ["verifying", "blocked", "failed", "cancelled"],
+  verifying: ["implementing", "reviewing", "blocked", "failed", "cancelled"],
+  reviewing: ["completed", "correcting", "blocked", "failed", "cancelled"],
+  correcting: ["verifying", "blocked", "failed", "cancelled"],
+  completed: [],
+  blocked: [
+    "normalizing",
+    "ready-for-diagnosis",
+    "ready-for-implementation",
+    "reviewing",
+    "cancelled",
+    "failed",
+  ],
+  failed: [],
+  cancelled: [
+    "normalizing",
+    "ready-for-diagnosis",
+    "ready-for-implementation",
+    "reviewing",
+    "failed",
+  ],
+};
+
+export function canTransitionTask(from: TaskStatus, to: TaskStatus): boolean {
+  return allowedTaskTransitions[from].includes(to);
+}
 
 export const taskTransitionSchema = z
   .object({

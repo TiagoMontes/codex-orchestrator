@@ -10,7 +10,7 @@ import type {
 import { OrchestratorError } from "../../shared/errors.js";
 import { parseCliValue } from "../validation.js";
 import type { OutputWriter } from "../output.js";
-import { writeResult } from "../output.js";
+import { codexProgressWriter, writeResult } from "../output.js";
 
 export function registerTaskDiagnoseCommand(
   task: Command,
@@ -32,9 +32,14 @@ export function registerTaskDiagnoseCommand(
     .option("--timeout <duration>")
     .description("Run bounded read-only diagnosis in a fresh Codex thread")
     .action(async (taskId: string, options: Record<string, string | boolean | undefined>) => {
-      const overrides = parseOverrides(options);
+      const json = program.opts<{ json?: boolean }>().json ?? false;
+      if (!json) output.write("[diagnosis] preparing detached read-only worktree");
+      const overrides: DiagnosisOverrides = {
+        ...parseOverrides(options),
+        ...(json ? {} : { progress: codexProgressWriter(output) }),
+      };
       const report = await diagnosis.diagnose(taskId, overrides);
-      if (program.opts<{ json?: boolean }>().json ?? false) {
+      if (json) {
         writeResult(output, report, true);
         return;
       }

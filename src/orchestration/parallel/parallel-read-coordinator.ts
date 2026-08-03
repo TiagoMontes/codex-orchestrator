@@ -13,8 +13,14 @@ import type { Evidence } from "../../domain/evidence/evidence.js";
 import type { ExecutionAttempt } from "../../domain/execution/execution-attempt.js";
 import type { ModelDecision } from "../../domain/execution/model-decision.js";
 import type { UsageLedgerDocument } from "../../domain/usage/usage-ledger.js";
-import type { CodexRuntime } from "../../infrastructure/codex/codex-runtime.js";
-import { resolveSafePath } from "../../infrastructure/filesystem/path-safety.js";
+import type {
+  CodexProgressObserver,
+  CodexRuntime,
+} from "../../infrastructure/codex/codex-runtime.js";
+import {
+  canonicalizeExistingPath,
+  resolveSafePath,
+} from "../../infrastructure/filesystem/path-safety.js";
 import { GitClient } from "../../infrastructure/git/git-client.js";
 import { GitCommandLog } from "../../infrastructure/git/git-command-log.js";
 import type { DecisionFileRepository } from "../../infrastructure/persistence/decision-file-repository.js";
@@ -31,6 +37,7 @@ import { sha256, stableJson } from "../../shared/hashing.js";
 import { ContextBudgetManager } from "../context/context-budget-manager.js";
 import { ContextIntegrityValidator } from "../context/context-integrity-validator.js";
 import { ContextPackBuilder } from "../context/context-pack-builder.js";
+import { assertStructuredOutputBounded } from "../context/structured-output-bound.js";
 import { ModelRouter, type RoutingOverrides } from "../routing/model-router.js";
 import { SkillRegistry } from "../../application/skills/skill-registry.js";
 import {
@@ -40,12 +47,16 @@ import {
   type ReadWorkerResult,
 } from "./parallel-read-result.js";
 import { assertIndependentWorkstreams, type ReadWorkstream } from "./workstream-partitioner.js";
+import { semanticEvidenceId, semanticEvidenceInput } from "../context/evidence-fingerprint.js";
+import { executionInputFingerprint } from "../../application/tasks/execution-input-fingerprint.js";
+import { projectAtWorkingRoot } from "../../application/projects/project-working-copy.js";
 
 export type ParallelReadOverrides = {
   model?: string;
   reasoning?: ReasoningPreset;
   maxParallelReaders?: number;
   timeoutMs?: number;
+  progress?: CodexProgressObserver;
   abortSignal?: AbortSignal;
 };
 
@@ -62,6 +73,11 @@ type PreparedWorker = {
   execution: ExecutionAttempt;
   contextPack: ReturnType<ContextPackBuilder["build"]>;
   workerTokenCap: number;
+};
+
+type WorkerStartGate = {
+  wait(): Promise<void>;
+  abort(error: unknown): void;
 };
 
 export class ParallelReadCoordinator {
@@ -129,8 +145,14 @@ export class ParallelReadCoordinator {
       input.workingDirectory === undefined
         ? input.project.gitRoot
         : await resolveSafePath(this.paths.worktreesDirectory, input.workingDirectory);
+    const phaseProject = await projectAtWorkingRoot(
+      input.project,
+      workingDirectory,
+      input.sourceCommit,
+    );
     const git = new GitClient({
-      observer: async (record) => this.gitLog.append(input.project.id, input.task.id, record),
+      observer: async (record) =>
+        this.gitLog.append(input.project.id, input.task.id, record, { phase: "exploration" }),
     });
     const before = {
       head: await git.resolveCommit(workingDirectory, "HEAD"),
@@ -148,6 +170,8 @@ export class ParallelReadCoordinator {
         prepared.push(
           await this.prepareWorker({
             ...input,
+            project: phaseProject,
+            workingDirectory,
             workstream,
             workerIndex,
             coordinatorId,
@@ -160,12 +184,26 @@ export class ParallelReadCoordinator {
         await this.serializeUsageMutation(async () =>
           this.usage.releaseReservation(input.project.id, input.task.id, worker.reservationId),
         );
+        await this.executions.save(input.project.id, {
+          ...worker.execution,
+          completedAt: isoNow(this.clock),
+          status: "blocked",
+          error: {
+            name: "OrchestratorError",
+            message: "Parallel worker admission was rolled back before execution",
+            code: "BUDGET",
+            resumable: true,
+          },
+        });
       }
       throw error;
     }
 
+    const startGate = createWorkerStartGate(prepared.length);
     const settled = await Promise.allSettled(
-      prepared.map(async (worker) => this.runWorker(input, worker)),
+      prepared.map(async (worker) =>
+        this.runWorker({ ...input, project: phaseProject }, worker, startGate),
+      ),
     );
     const attempts: ExecutionAttempt[] = [];
     const results: ReadWorkerResult[] = [];
@@ -188,6 +226,12 @@ export class ParallelReadCoordinator {
       });
     }
     const evidence = deduplicateEvidence(results.flatMap((result) => result.evidence));
+    if (evidence.length > this.config.context.maxEvidenceItems) {
+      throw new OrchestratorError("Parallel evidence exceeds the configured task bound", {
+        code: "BUDGET",
+        resumable: true,
+      });
+    }
     await this.evidenceRepository.merge(input.project.id, input.task.id, evidence);
     const consolidated = consolidatedReadResultSchema.parse({
       schemaVersion: 1,
@@ -221,6 +265,7 @@ export class ParallelReadCoordinator {
     task: Task;
     project: Project;
     sourceCommit: string;
+    workingDirectory: string;
     profile: ExecutionProfile;
     overrides?: ParallelReadOverrides;
     workstream: ReadWorkstream;
@@ -245,10 +290,33 @@ export class ParallelReadCoordinator {
       selectedSkills,
       outputSchema: toJsonSchema(readWorkerResultSchema),
     });
-    await this.integrity.assertLiveInstructionFiles(pack, {
-      task: input.task,
-      project: input.project,
+    await this.integrity.assertLiveInstructionFiles(
+      pack,
+      {
+        task: input.task,
+        project: input.project,
+        sourceCommit: input.sourceCommit,
+      },
+      input.workingDirectory,
+    );
+    const inputFingerprint = executionInputFingerprint({
+      phase: "exploration",
+      taskId: input.task.id,
+      projectId: input.project.id,
       sourceCommit: input.sourceCommit,
+      workstream: input.workstream,
+      instructions: input.project.instructionFiles.map(({ relativePath, sha256 }) => ({
+        relativePath,
+        sha256,
+      })),
+      selectedSkills: selectedSkills.map(
+        ({ name, source, sha256: skillSha256, instructionsSha256 }) => ({
+          name,
+          source,
+          sha256: skillSha256,
+          instructionsSha256,
+        }),
+      ),
     });
     const ledger = await this.usage.read(input.project.id, input.task.id);
     const remaining = Math.max(
@@ -291,7 +359,6 @@ export class ParallelReadCoordinator {
       "context-packs",
       `read-${input.workstream.id}-${executionId}.json`,
     );
-    await this.store.write(contextPackPath, pack);
     const eventsPath = join(
       this.paths.taskDirectory(input.project.id, input.task.id),
       "logs",
@@ -303,6 +370,8 @@ export class ParallelReadCoordinator {
       taskId: input.task.id,
       phase: "exploration",
       attemptNumber: input.workerIndex + 1,
+      reservationId: admission.reservation.id,
+      inputFingerprint,
       modelDecision,
       sandboxMode: "read-only",
       contextPackPath,
@@ -311,25 +380,51 @@ export class ParallelReadCoordinator {
       status: "running",
       eventsPath,
     };
-    await this.executions.save(input.project.id, execution);
-    await this.decisions.append(input.project.id, input.task.id, {
-      kind: "model-routing",
-      summary: `${modelDecision.model} / ${modelDecision.reasoning} selected for read worker ${input.workstream.id}`,
-      details: {
-        ...modelDecision,
-        workerId: input.workstream.id,
-        coordinatorId: input.coordinatorId,
+    let executionPersisted = false;
+    try {
+      await this.store.write(contextPackPath, pack);
+      await this.executions.save(input.project.id, execution);
+      executionPersisted = true;
+      await this.decisions.append(input.project.id, input.task.id, {
+        kind: "model-routing",
+        summary: `${modelDecision.model} / ${modelDecision.reasoning} selected for read worker ${input.workstream.id}`,
+        details: {
+          ...modelDecision,
+          workerId: input.workstream.id,
+          coordinatorId: input.coordinatorId,
+          workerTokenCap,
+        },
+      });
+      return {
+        workstream: input.workstream,
+        modelDecision,
+        reservationId: admission.reservation.id,
+        execution,
+        contextPack: pack,
         workerTokenCap,
-      },
-    });
-    return {
-      workstream: input.workstream,
-      modelDecision,
-      reservationId: admission.reservation.id,
-      execution,
-      contextPack: pack,
-      workerTokenCap,
-    };
+      };
+    } catch (error) {
+      await this.serializeUsageMutation(async () =>
+        this.usage.releaseReservation(input.project.id, input.task.id, admission.reservation.id),
+      ).catch(() => undefined);
+      if (executionPersisted) {
+        const normalized = toOrchestratorError(error);
+        await this.executions
+          .save(input.project.id, {
+            ...execution,
+            completedAt: isoNow(this.clock),
+            status: normalized.resumable ? "blocked" : "failed",
+            error: {
+              name: normalized.name,
+              message: normalized.message,
+              code: normalized.code,
+              resumable: normalized.resumable,
+            },
+          })
+          .catch(() => undefined);
+      }
+      throw error;
+    }
   }
 
   private async runWorker(
@@ -343,8 +438,10 @@ export class ParallelReadCoordinator {
       overrides?: ParallelReadOverrides;
     },
     worker: PreparedWorker,
+    startGate: WorkerStartGate,
   ): Promise<{ result: ReadWorkerResult; execution: ExecutionAttempt }> {
     let execution = worker.execution;
+    let callStarted = false;
     try {
       const prompt = await this.promptLoader.render("read-worker.prompt.md", {
         WORKER_ID: worker.workstream.id,
@@ -353,6 +450,10 @@ export class ParallelReadCoordinator {
         WORKER_TOKEN_CAP: String(worker.workerTokenCap),
         CONTEXT_PACK: stableJson(worker.contextPack),
       });
+      await startGate.wait();
+      execution = { ...execution, callStartedAt: isoNow(this.clock) };
+      await this.executions.save(parent.project.id, execution);
+      callStarted = true;
       const runtimeResult = await this.runtime.runStructured({
         role: "read-worker",
         prompt,
@@ -366,10 +467,16 @@ export class ParallelReadCoordinator {
         outputValidator: readWorkerResultSchema,
         timeoutMs: parent.overrides?.timeoutMs ?? this.config.runtime.defaultTimeoutSeconds * 1_000,
         eventsPath: execution.eventsPath,
+        additionalAllowedEnvironmentNames: parent.project.environmentPolicy.allowlist,
+        explicitSecretEnvironmentExceptions: parent.project.environmentPolicy.secretExceptions,
+        ...(parent.overrides?.progress === undefined
+          ? {}
+          : { progress: parent.overrides.progress }),
         ...(parent.overrides?.abortSignal === undefined
           ? {}
           : { abortSignal: parent.overrides.abortSignal }),
       });
+      assertStructuredOutputBounded(runtimeResult.output, this.config);
       const output = readWorkerResultSchema.parse(runtimeResult.output);
       if (
         output.workerId !== worker.workstream.id ||
@@ -379,6 +486,16 @@ export class ParallelReadCoordinator {
         throw new OrchestratorError("Parallel read worker identity mismatch", {
           code: "CONTEXT_INTEGRITY",
         });
+      }
+      const workerEvidenceLimit = Math.max(
+        1,
+        Math.floor(this.config.context.maxEvidenceItems / parent.workstreams.length),
+      );
+      if (output.evidence.length > workerEvidenceLimit) {
+        throw new OrchestratorError(
+          `Read worker ${worker.workstream.id} exceeded its evidence allocation`,
+          { code: "BUDGET", resumable: true },
+        );
       }
       const evidence = await this.validateEvidence(output.evidence, worker.workstream, parent);
       const result = readWorkerResultSchema.parse({
@@ -415,9 +532,24 @@ export class ParallelReadCoordinator {
       await this.executions.save(parent.project.id, execution);
       return { result, execution };
     } catch (error) {
-      await this.serializeUsageMutation(async () =>
-        this.usage.releaseReservation(parent.project.id, parent.task.id, worker.reservationId),
-      ).catch(() => undefined);
+      startGate.abort(error);
+      await this.serializeUsageMutation(async () => {
+        if (!callStarted) {
+          await this.usage.releaseReservation(
+            parent.project.id,
+            parent.task.id,
+            worker.reservationId,
+          );
+          return;
+        }
+        await this.usage.commitFailedReservation({
+          projectId: parent.project.id,
+          taskId: parent.task.id,
+          reservationId: worker.reservationId,
+          model: worker.modelDecision.model,
+          reasoning: worker.modelDecision.reasoning,
+        });
+      }).catch(() => undefined);
       const normalized = toOrchestratorError(error);
       execution = {
         ...execution,
@@ -446,15 +578,19 @@ export class ParallelReadCoordinator {
     parent: { task: Task; project: Project; sourceCommit: string; workingDirectory?: string },
   ): Promise<Evidence[]> {
     return Promise.all(
-      items.map(async (item, index) => {
+      items.map(async (item) => {
         if (item.taskId !== parent.task.id || item.sourceCommit !== parent.sourceCommit) {
           throw new OrchestratorError("Read worker evidence identity mismatch", {
             code: "CONTEXT_INTEGRITY",
           });
         }
-        const id = `PW-${workstream.id}-${index + 1}-${sha256(stableJson(item)).slice(0, 10)}`;
-        if (item.file === undefined) return { ...item, id };
-        const root = parent.workingDirectory ?? parent.project.gitRoot;
+        if (item.file === undefined) {
+          const semantic = { ...item, id: "pending" };
+          return { ...semantic, id: semanticEvidenceId("PW", semantic) };
+        }
+        const root = await canonicalizeExistingPath(
+          parent.workingDirectory ?? parent.project.gitRoot,
+        );
         const path = await resolveSafePath(root, item.file);
         const relativePath = relative(root, path).replaceAll("\\", "/");
         if (
@@ -475,9 +611,9 @@ export class ParallelReadCoordinator {
             code: "CONTEXT_INTEGRITY",
           });
         }
-        return {
+        const semantic: Evidence = {
           ...item,
-          id,
+          id: "pending",
           file: relativePath,
           startLine,
           endLine,
@@ -487,6 +623,7 @@ export class ParallelReadCoordinator {
             .slice(0, 4_000),
           sha256: sha256(contents),
         };
+        return { ...semantic, id: semanticEvidenceId("PW", semantic) };
       }),
     );
   }
@@ -501,6 +638,33 @@ export class ParallelReadCoordinator {
   }
 }
 
+function createWorkerStartGate(participantCount: number): WorkerStartGate {
+  let arrivals = 0;
+  let abortedWith: unknown;
+  let released = false;
+  let release!: () => void;
+  const ready = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const releaseOnce = (): void => {
+    if (released) return;
+    released = true;
+    release();
+  };
+  return {
+    async wait(): Promise<void> {
+      arrivals += 1;
+      if (arrivals >= participantCount || abortedWith !== undefined) releaseOnce();
+      await ready;
+      if (abortedWith !== undefined) throw toOrchestratorError(abortedWith);
+    },
+    abort(error: unknown): void {
+      abortedWith ??= error;
+      releaseOnce();
+    },
+  };
+}
+
 function pathContains(scope: string, candidate: string): boolean {
   const normalizedScope = scope.replaceAll("\\", "/").replace(/^\.\//u, "").replace(/\/$/u, "");
   const normalizedCandidate = candidate.replaceAll("\\", "/").replace(/^\.\//u, "");
@@ -512,17 +676,7 @@ function pathContains(scope: string, candidate: string): boolean {
 function deduplicateEvidence(items: readonly Evidence[]): Evidence[] {
   const byFingerprint = new Map<string, Evidence>();
   for (const item of items) {
-    const fingerprint = sha256(
-      stableJson({
-        kind: item.kind,
-        statement: item.statement,
-        sourceCommit: item.sourceCommit,
-        file: item.file,
-        startLine: item.startLine,
-        endLine: item.endLine,
-        sha256: item.sha256,
-      }),
-    );
+    const fingerprint = sha256(stableJson(semanticEvidenceInput(item)));
     if (!byFingerprint.has(fingerprint)) byFingerprint.set(fingerprint, item);
   }
   return [...byFingerprint.values()].sort((left, right) => left.id.localeCompare(right.id));

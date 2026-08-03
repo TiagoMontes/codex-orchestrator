@@ -17,6 +17,8 @@ export type PreparedWorktree = {
 export type CleanupWorktreeOptions = {
   force?: boolean;
   deleteBranch?: boolean;
+  beforeRemove?: () => Promise<void>;
+  afterRemove?: () => Promise<void>;
 };
 
 export type CleanupWorktreeReport = {
@@ -119,7 +121,9 @@ export class WorktreeManager {
         { code: "TASK_STATE", resumable: true },
       );
     }
+    await options.beforeRemove?.();
     await this.git.removeWorktree(repositoryRoot, safePath, options.force ?? false);
+    await options.afterRemove?.();
 
     let branchDeleted = false;
     if (options.deleteBranch ?? false) {

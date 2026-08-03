@@ -1,43 +1,7 @@
 import type { TaskStateDocument, TaskTransition } from "../../domain/task/task-state.js";
 import type { TaskStatus } from "../../domain/task/task.js";
+import { canTransitionTask } from "../../domain/task/task-state.js";
 import { OrchestratorError } from "../../shared/errors.js";
-
-const ALLOWED_TRANSITIONS: Readonly<Record<TaskStatus, readonly TaskStatus[]>> = {
-  created: ["normalizing", "blocked", "cancelled", "failed"],
-  normalizing: ["ready-for-diagnosis", "blocked", "failed", "cancelled"],
-  "ready-for-diagnosis": ["diagnosing", "blocked", "cancelled", "failed"],
-  diagnosing: ["diagnosed", "blocked", "failed", "cancelled"],
-  diagnosed: ["worktree-preparing", "blocked", "cancelled", "failed"],
-  "worktree-preparing": ["ready-for-implementation", "blocked", "failed", "cancelled"],
-  "ready-for-implementation": [
-    "worktree-preparing",
-    "implementing",
-    "blocked",
-    "cancelled",
-    "failed",
-  ],
-  implementing: ["verifying", "blocked", "failed", "cancelled"],
-  verifying: ["implementing", "reviewing", "blocked", "failed", "cancelled"],
-  reviewing: ["completed", "correcting", "blocked", "failed", "cancelled"],
-  correcting: ["verifying", "blocked", "failed", "cancelled"],
-  completed: [],
-  blocked: [
-    "normalizing",
-    "ready-for-diagnosis",
-    "ready-for-implementation",
-    "reviewing",
-    "cancelled",
-    "failed",
-  ],
-  failed: [],
-  cancelled: [
-    "normalizing",
-    "ready-for-diagnosis",
-    "ready-for-implementation",
-    "reviewing",
-    "failed",
-  ],
-};
 
 export type TransitionInput = Omit<TaskTransition, "previousState" | "timestamp"> & {
   timestamp: string;
@@ -45,7 +9,7 @@ export type TransitionInput = Omit<TaskTransition, "previousState" | "timestamp"
 
 export class TaskStateMachine {
   canTransition(from: TaskStatus, to: TaskStatus): boolean {
-    return ALLOWED_TRANSITIONS[from].includes(to);
+    return canTransitionTask(from, to);
   }
 
   transition(state: TaskStateDocument, input: TransitionInput): TaskStateDocument {

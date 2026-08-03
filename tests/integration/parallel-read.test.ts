@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -48,7 +48,31 @@ describe("parallel read coordination", () => {
     const stateHome = await mkdtemp(join(tmpdir(), "cxo-parallel-state-"));
     temporaryDirectories.push(repositoryRoot, stateHome);
     await createGitFixture(repositoryRoot);
+    const skillPath = join(repositoryRoot, ".agents", "skills", "fixture-skill", "SKILL.md");
+    await writeFile(
+      skillPath,
+      "---\nname: fixture-skill\ndescription: Explore the historical fixture.\ntags: [exploration]\n---\n\nHistorical exploration instructions.\n",
+      "utf8",
+    );
+    await gitOutput(repositoryRoot, ["add", ".agents/skills/fixture-skill/SKILL.md"]);
+    await gitOutput(repositoryRoot, ["commit", "-m", "test: add historical exploration skill"]);
     const fixture = await createDiagnosedTaskFixture(repositoryRoot, stateHome);
+    const workingDirectory = join(fixture.paths.worktreesDirectory, "parallel-metadata");
+    await gitOutput(repositoryRoot, [
+      "worktree",
+      "add",
+      "--detach",
+      workingDirectory,
+      fixture.sourceCommit,
+    ]);
+    await writeFile(join(repositoryRoot, "AGENTS.md"), "# Future primary instructions\n", "utf8");
+    await writeFile(
+      skillPath,
+      "---\nname: fixture-skill\ndescription: Explore the future fixture.\ntags: [exploration]\n---\n\nFuture primary exploration instructions.\n",
+      "utf8",
+    );
+    await gitOutput(repositoryRoot, ["add", "AGENTS.md", ".agents"]);
+    await gitOutput(repositoryRoot, ["commit", "-m", "test: advance primary metadata"]);
     const config = await fixture.config.load();
     let active = 0;
     let maximumActive = 0;
@@ -124,6 +148,7 @@ describe("parallel read coordination", () => {
       sourceCommit: fixture.sourceCommit,
       profile: "balanced",
       workstreams,
+      workingDirectory,
     });
 
     expect(maximumActive).toBe(2);
@@ -138,6 +163,14 @@ describe("parallel read coordination", () => {
       ),
     ).toBe(true);
     expect(new Set(requests.map((request) => request.eventsPath)).size).toBe(2);
+    expect(
+      requests.every((request) => request.prompt.includes("Historical exploration instructions.")),
+    ).toBe(true);
+    expect(
+      requests.some((request) =>
+        request.prompt.includes("Future primary exploration instructions."),
+      ),
+    ).toBe(false);
     expect(report.result.workerIds).toEqual(["implementation-module", "test-module"]);
     expect(report.result.evidence).toHaveLength(2);
     expect(JSON.stringify(report.result)).not.toContain("raw worker chatter");
@@ -147,7 +180,7 @@ describe("parallel read coordination", () => {
       "implementation-module",
       "test-module",
     ]);
-    expect(await gitOutput(repositoryRoot, ["rev-parse", "HEAD"])).toBe(fixture.sourceCommit);
+    expect(await gitOutput(repositoryRoot, ["rev-parse", "HEAD"])).not.toBe(fixture.sourceCommit);
     expect(
       await gitOutput(repositoryRoot, ["status", "--porcelain=v1", "--untracked-files=all"]),
     ).toBe(beforeStatus);
@@ -189,6 +222,47 @@ describe("parallel read coordination", () => {
 
     expect(runtimeCalls).toBe(0);
     expect((await usage.read(fixture.project.id, fixture.task.id)).reservations).toEqual([]);
+  });
+
+  it("releases every worker reservation when durable call-start markers fail", async () => {
+    const repositoryRoot = await mkdtemp(join(tmpdir(), "cxo-parallel-marker-fixture-"));
+    const stateHome = await mkdtemp(join(tmpdir(), "cxo-parallel-marker-state-"));
+    temporaryDirectories.push(repositoryRoot, stateHome);
+    await createGitFixture(repositoryRoot);
+    const fixture = await createDiagnosedTaskFixture(repositoryRoot, stateHome);
+    const config = await fixture.config.load();
+    const usage = new UsageFileRepository(fixture.paths);
+    const persistedExecutions = new ExecutionFileRepository(fixture.paths);
+    const executions = {
+      save: (projectId: string, attempt: Parameters<ExecutionFileRepository["save"]>[1]) =>
+        attempt.status === "running" && attempt.callStartedAt !== undefined
+          ? Promise.reject(new Error("simulated call-start persistence failure"))
+          : persistedExecutions.save(projectId, attempt),
+    } as unknown as ExecutionFileRepository;
+    let runtimeCalls = 0;
+    const runtime: CodexRuntime = {
+      runStructured: () => {
+        runtimeCalls += 1;
+        return Promise.reject(new Error("runtime must not start"));
+      },
+    };
+
+    await expect(
+      createCoordinator(config, fixture, runtime, usage, executions).run({
+        task: fixture.task,
+        project: fixture.project,
+        sourceCommit: fixture.sourceCommit,
+        profile: "balanced",
+        workstreams,
+      }),
+    ).rejects.toThrow("call-start persistence failure");
+
+    expect(runtimeCalls).toBe(0);
+    expect(await usage.read(fixture.project.id, fixture.task.id)).toMatchObject({
+      totalCalls: 0,
+      entries: [],
+      reservations: [],
+    });
   });
 
   it("blocks out-of-scope worker evidence and leaves no reservation", async () => {
@@ -266,6 +340,7 @@ function createCoordinator(
   fixture: Awaited<ReturnType<typeof createDiagnosedTaskFixture>>,
   runtime: CodexRuntime,
   usage: UsageFileRepository,
+  executions: ExecutionFileRepository = new ExecutionFileRepository(fixture.paths),
 ): ParallelReadCoordinator {
   return new ParallelReadCoordinator(
     config,
@@ -273,7 +348,7 @@ function createCoordinator(
     runtime,
     usage,
     new EvidenceFileRepository(fixture.paths),
-    new ExecutionFileRepository(fixture.paths),
+    executions,
     new DecisionFileRepository(fixture.paths),
     { now: () => new Date("2026-08-02T12:02:00.000Z") },
   );

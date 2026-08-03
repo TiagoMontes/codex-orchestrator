@@ -32,12 +32,30 @@ describe("task review", () => {
     const stateHome = await mkdtemp(join(tmpdir(), "cxo-review-state-"));
     temporaryDirectories.push(fixture, stateHome);
     await createGitFixture(fixture);
+    const skillPath = join(fixture, ".agents", "skills", "fixture-skill", "SKILL.md");
+    await writeFile(
+      skillPath,
+      "---\nname: fixture-skill\ndescription: Review the historical fixture.\ntags: [review]\n---\n\nHistorical review instructions.\n",
+      "utf8",
+    );
+    await gitOutput(fixture, ["add", ".agents/skills/fixture-skill/SKILL.md"]);
+    await gitOutput(fixture, ["commit", "-m", "test: add historical review skill"]);
     const seeded = await createImplementedTaskFixture(fixture, stateHome);
+    await writeFile(join(fixture, "AGENTS.md"), "# New primary review instructions\n", "utf8");
+    await writeFile(
+      skillPath,
+      "---\nname: fixture-skill\ndescription: Review the future fixture.\ntags: [review]\n---\n\nFuture primary review instructions.\n",
+      "utf8",
+    );
+    await writeFile(join(fixture, "primary-note.md"), "Primary branch advanced.\n", "utf8");
+    await gitOutput(fixture, ["add", "AGENTS.md", ".agents", "primary-note.md"]);
+    await gitOutput(fixture, ["commit", "-m", "advance primary before review"]);
     const beforeHead = await gitOutput(fixture, ["rev-parse", "HEAD"]);
     const beforeStatus = await gitOutput(fixture, ["status", "--porcelain=v1"]);
     const roles: string[] = [];
     const sandboxes: string[] = [];
     const threadIds: string[] = [];
+    const reviewerPrompts: string[] = [];
     let reviewCalls = 0;
     const runtime: CodexRuntime = {
       runStructured: async (request) => {
@@ -68,6 +86,7 @@ describe("task review", () => {
           );
         }
         reviewCalls += 1;
+        reviewerPrompts.push(request.prompt);
         const diff = await new DiffService(seeded.paths).read(seeded.project.id, seeded.task.id);
         const verification = await new VerificationFileRepository(seeded.paths).read(
           seeded.project.id,
@@ -152,6 +171,13 @@ describe("task review", () => {
       "review-correction-thread",
       "reviewer-thread-2",
     ]);
+    expect(reviewerPrompts).toHaveLength(2);
+    expect(
+      reviewerPrompts.every((prompt) => prompt.includes("Historical review instructions.")),
+    ).toBe(true);
+    expect(
+      reviewerPrompts.some((prompt) => prompt.includes("Future primary review instructions.")),
+    ).toBe(false);
     expect(report.reviews).toHaveLength(2);
     expect(report.corrections).toHaveLength(1);
     expect(report.reviews[0]?.reviewedDiffHash).not.toBe(report.reviews[1]?.reviewedDiffHash);
@@ -166,7 +192,7 @@ describe("task review", () => {
     );
     expect(await gitOutput(fixture, ["rev-parse", "HEAD"])).toBe(beforeHead);
     expect(await gitOutput(fixture, ["status", "--porcelain=v1"])).toBe(beforeStatus);
-  });
+  }, 15_000);
 
   it("invalidates verification and blocks before review when the worktree diff changes", async () => {
     const fixture = await mkdtemp(join(tmpdir(), "cxo-stale-review-fixture-"));

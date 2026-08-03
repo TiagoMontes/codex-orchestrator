@@ -45,6 +45,12 @@ export class DiffService {
         this.git.diffPatch(worktreePath, resolvedBase),
       ]);
     const taskDirectory = this.paths.taskDirectory(input.projectId, input.taskId);
+    if (worktreeHead !== resolvedBase) {
+      throw new OrchestratorError("Task writers must not create commits in the worktree", {
+        code: "CONTEXT_INTEGRITY",
+        resumable: true,
+      });
+    }
     const patchPath = join(taskDirectory, "diff.patch");
     await this.textWriter.writeText(patchPath, patch);
     const artifact = diffArtifactSchema.parse({
@@ -74,7 +80,16 @@ export class DiffService {
 
   async assertCurrent(artifact: DiffArtifact, worktreePath: string): Promise<void> {
     const safePath = await resolveSafePath(this.paths.worktreesDirectory, worktreePath);
-    const patch = await this.git.diffPatch(safePath, artifact.baseCommit);
+    const [head, patch] = await Promise.all([
+      this.git.resolveCommit(safePath, "HEAD"),
+      this.git.diffPatch(safePath, artifact.baseCommit),
+    ]);
+    if (head !== artifact.worktreeHead || head !== artifact.baseCommit) {
+      throw new OrchestratorError("The worktree HEAD changed after diff capture", {
+        code: "CONTEXT_INTEGRITY",
+        resumable: true,
+      });
+    }
     if (sha256(patch) !== artifact.diffHash) {
       throw new OrchestratorError("The worktree diff changed after capture", {
         code: "CONTEXT_INTEGRITY",

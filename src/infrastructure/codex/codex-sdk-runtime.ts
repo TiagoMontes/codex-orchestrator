@@ -118,16 +118,21 @@ export class CodexSdkRuntime implements CodexRuntime {
               type: "runtime.output_repair",
               originalThreadId: result.threadId,
             });
+            emitProgress(request, { role: request.role, kind: "output-repair" });
             const repairRequest = { ...request };
             delete repairRequest.resumeThreadId;
             repairRequest.prompt = repairPrompt(result.finalResponse, validationError);
             repairRequest.reasoningPreset = "minimal";
-            const repair = await this.runAttempt(
-              repairRequest,
-              "minimal",
-              controller.signal,
-              recorder,
-            );
+            let repair: Awaited<ReturnType<CodexSdkRuntime["runAttempt"]>>;
+            try {
+              repair = await this.runAttempt(repairRequest, "minimal", controller.signal, recorder);
+            } catch (repairCallError) {
+              throw new CodexRuntimeError("Codex structured-output repair call failed", {
+                cause: repairCallError,
+                resumable: true,
+                compatibilityFailure: false,
+              });
+            }
             try {
               output = parseStructuredOutput(repair.finalResponse, request.outputValidator);
             } catch (repairError) {
@@ -179,6 +184,10 @@ export class CodexSdkRuntime implements CodexRuntime {
             await recorder.record({
               type: request.abortSignal?.aborted ? "runtime.cancelled" : "runtime.timeout",
             });
+            emitProgress(request, {
+              role: request.role,
+              kind: request.abortSignal?.aborted ? "runtime-cancelled" : "runtime-timeout",
+            });
             if (request.abortSignal?.aborted ?? false) {
               if (
                 request.abortSignal?.reason instanceof OrchestratorError &&
@@ -205,6 +214,7 @@ export class CodexSdkRuntime implements CodexRuntime {
             to: efforts[1],
             reason: fallbackReason,
           });
+          emitProgress(request, { role: request.role, kind: "reasoning-fallback" });
         }
       }
       throw new CodexRuntimeError("No supported reasoning effort is available", {
@@ -227,7 +237,14 @@ export class CodexSdkRuntime implements CodexRuntime {
     usage: NormalizedUsage;
     missingUsageFields: string[];
   }> {
-    const sanitized = this.sanitizer.sanitize(this.environment);
+    const sanitized = this.sanitizer.sanitize(this.environment, {
+      ...(request.additionalAllowedEnvironmentNames === undefined
+        ? {}
+        : { additionalAllowedNames: request.additionalAllowedEnvironmentNames }),
+      ...(request.explicitSecretEnvironmentExceptions === undefined
+        ? {}
+        : { explicitSecretExceptions: request.explicitSecretEnvironmentExceptions }),
+    });
     for (const warning of sanitized.warnings) {
       await recorder.record({ type: "runtime.environment_warning", warning });
     }
@@ -257,6 +274,8 @@ export class CodexSdkRuntime implements CodexRuntime {
     let usage: Usage | undefined;
     for await (const event of streamed.events) {
       await recorder.record(event);
+      const progress = progressForEvent(request.role, event);
+      if (progress !== undefined) emitProgress(request, progress);
       if (event.type === "thread.started") threadId = event.thread_id;
       if (event.type === "item.completed" && event.item.type === "agent_message") {
         finalResponse = event.item.text;
@@ -296,6 +315,48 @@ export class CodexSdkRuntime implements CodexRuntime {
     }
     return valid;
   }
+}
+
+function emitProgress<T>(
+  request: CodexRunRequest<T>,
+  event: Parameters<NonNullable<CodexRunRequest<T>["progress"]>>[0],
+): void {
+  try {
+    request.progress?.(event);
+  } catch {
+    // Observability must never change orchestration semantics.
+  }
+}
+
+function progressForEvent(
+  role: CodexRunRequest<unknown>["role"],
+  event: ThreadEvent,
+): Parameters<NonNullable<CodexRunRequest<unknown>["progress"]>>[0] | undefined {
+  if (event.type === "thread.started") return { role, kind: "thread-started" };
+  if (event.type === "item.completed" && event.item.type === "command_execution") {
+    return {
+      role,
+      kind: "command-completed",
+      status: event.item.status,
+      ...(event.item.exit_code === undefined ? {} : { exitCode: event.item.exit_code }),
+    };
+  }
+  if (event.type === "item.completed" && event.item.type === "mcp_tool_call") {
+    return {
+      role,
+      kind: "tool-completed",
+      server: event.item.server,
+      tool: event.item.tool,
+      status: event.item.status,
+    };
+  }
+  if (event.type === "turn.completed") {
+    return { role, kind: "turn-completed", usage: normalizeUsage(event.usage).usage };
+  }
+  if (event.type === "turn.failed" || event.type === "error") {
+    return { role, kind: "turn-failed" };
+  }
+  return undefined;
 }
 
 function repairPrompt(invalidOutput: string, validationError: unknown): string {

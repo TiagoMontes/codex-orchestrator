@@ -5,9 +5,12 @@ import { FileLockManager } from "../../infrastructure/persistence/file-lock.js";
 import { OrchestratorError } from "../../shared/errors.js";
 import type { StatePaths } from "../../infrastructure/persistence/state-paths.js";
 import { DiffService } from "../../infrastructure/git/diff-service.js";
+import { GitClientFactory } from "../../infrastructure/git/git-client-factory.js";
 import { TaskStateMachine } from "../../orchestration/engine/state-machine.js";
 import type { Clock } from "../../shared/clock.js";
 import { isoNow, systemClock } from "../../shared/clock.js";
+import type { UsageFileRepository } from "../../infrastructure/persistence/usage-file-repository.js";
+import { recoverInterruptedUsage } from "./interrupted-usage-recovery.js";
 
 export type TaskCleanupReport = {
   taskId: string;
@@ -32,22 +35,26 @@ export interface TaskCleaner {
 export class TaskCleanupService implements TaskCleaner {
   private readonly operationLocks: FileLockManager;
   private readonly stateMachine = new TaskStateMachine();
+  private readonly gitClients: GitClientFactory;
 
   constructor(
     private readonly paths: StatePaths,
     private readonly tasks: TaskFileRepository,
     private readonly executions: ExecutionFileRepository,
     private readonly worktrees: TaskWorktreeService,
+    private readonly usage?: UsageFileRepository,
     private readonly clock: Clock = systemClock,
   ) {
     this.operationLocks = new FileLockManager(paths.locksDirectory);
+    this.gitClients = new GitClientFactory(paths);
   }
 
   async cleanup(
     taskId: string,
     options: { removeWorktree?: boolean; deleteBranch?: boolean } = {},
   ): Promise<TaskCleanupReport> {
-    let task = await this.tasks.get(taskId);
+    let { task, state } = await this.tasks.getSnapshot(taskId);
+    assertSynchronized(task.status, state.status);
     if (options.deleteBranch === true && options.removeWorktree !== true) {
       throw new OrchestratorError("--delete-branch requires --remove-worktree", {
         code: "CLI_INPUT",
@@ -71,8 +78,8 @@ export class TaskCleanupService implements TaskCleaner {
 
     const operationLock = await this.operationLocks.acquire(`task-operation:${taskId}`);
     try {
-      task = await this.tasks.get(taskId);
-      let state = await this.tasks.getState(taskId);
+      ({ task, state } = await this.tasks.getSnapshot(taskId));
+      assertSynchronized(task.status, state.status);
       if (task.worktree === undefined) {
         throw new OrchestratorError(`Task ${taskId} has no worktree to remove`, {
           code: "TASK_STATE",
@@ -82,10 +89,11 @@ export class TaskCleanupService implements TaskCleaner {
         throw new OrchestratorError("Task cleanup is unsafe while work may still be active", {
           code: "TASK_STATE",
           resumable: true,
-          nextCommand: `cxo task cancel ${taskId}`,
+          nextCommand: `cxo task status ${taskId}`,
         });
       }
 
+      await recoverInterruptedUsage(task, this.usage, this.executions);
       const attempts = await this.executions.list(task.projectId, task.id);
       const running = attempts.filter((attempt) => attempt.status === "running");
       if (task.status === "completed" && running.length > 0) {
@@ -108,7 +116,10 @@ export class TaskCleanupService implements TaskCleaner {
         });
       }
 
-      const diffService = new DiffService(this.paths);
+      const diffService = new DiffService(
+        this.paths,
+        this.gitClients.task(task.projectId, task.id, { phase: "cleanup" }),
+      );
       let recoveryPatchPath: string;
       if (task.status === "completed") {
         const diff = await diffService.read(task.projectId, task.id);
@@ -145,25 +156,29 @@ export class TaskCleanupService implements TaskCleaner {
         recoveryPatchPath = recovery.patchPath;
       }
 
-      if (task.status === "blocked" || task.status === "cancelled") {
-        state = this.stateMachine.transition(state, {
-          nextState: "failed",
-          timestamp,
-          reason: "User explicitly abandoned the task worktree after recovery-patch capture",
-          actor: "user",
-        });
-        task = {
-          ...task,
-          status: "failed",
-          revision: task.revision + 1,
-          updatedAt: timestamp,
-        };
-        await this.tasks.update(task, state);
-      }
-
       const report = await this.worktrees.cleanup(taskId, {
         force: true,
         deleteBranch: options.deleteBranch ?? false,
+        ...(task.status === "blocked" || task.status === "cancelled"
+          ? {
+              beforeRemove: async () => {
+                state = this.stateMachine.transition(state, {
+                  nextState: "failed",
+                  timestamp,
+                  reason:
+                    "User explicitly abandoned the task worktree after recovery-patch capture",
+                  actor: "user",
+                });
+                task = {
+                  ...task,
+                  status: "failed",
+                  revision: task.revision + 1,
+                  updatedAt: timestamp,
+                };
+                await this.tasks.update(task, state);
+              },
+            }
+          : {}),
       });
       return {
         taskId,
@@ -180,5 +195,13 @@ export class TaskCleanupService implements TaskCleaner {
     } finally {
       await operationLock.release();
     }
+  }
+}
+
+function assertSynchronized(taskStatus: string, stateStatus: string): void {
+  if (taskStatus !== stateStatus) {
+    throw new OrchestratorError("Task and state documents disagree during cleanup", {
+      code: "CONTEXT_INTEGRITY",
+    });
   }
 }

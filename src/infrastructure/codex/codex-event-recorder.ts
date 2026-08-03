@@ -20,7 +20,8 @@ export class CodexEventRecorder {
   ) {}
 
   async record(event: RecordedRuntimeEvent): Promise<void> {
-    if (this.truncated) return;
+    const terminal = isTerminalEvent(event);
+    if (this.truncated && !terminal) return;
     await mkdir(dirname(this.path), { recursive: true, mode: 0o700 });
     this.bytesWritten ??= await stat(this.path)
       .then((value) => value.size)
@@ -33,14 +34,36 @@ export class CodexEventRecorder {
     };
     const line = `${JSON.stringify(record)}\n`;
     const size = Buffer.byteLength(line);
-    if (this.bytesWritten + size > this.maxBytes) {
+    const terminalReserve = Math.min(64 * 1_024, Math.floor(this.maxBytes / 2));
+    const normalLimit = this.maxBytes - terminalReserve;
+    if (!terminal && this.bytesWritten + size > normalLimit) {
       this.truncated = true;
+      await this.appendIfWithinLimit(
+        `${JSON.stringify({
+          schemaVersion: 1,
+          observedAt: this.clock.now().toISOString(),
+          type: "runtime.event_log_truncated",
+          payload: { maxBytes: this.maxBytes },
+        })}\n`,
+        normalLimit,
+      );
       return;
     }
+    if (this.bytesWritten + size > this.maxBytes) return;
+    await this.append(line);
+  }
+
+  private async appendIfWithinLimit(line: string, limit: number): Promise<void> {
+    this.bytesWritten ??= 0;
+    if (this.bytesWritten + Buffer.byteLength(line) > limit) return;
+    await this.append(line);
+  }
+
+  private async append(line: string): Promise<void> {
     const handle = await open(this.path, "a", 0o600);
     try {
       await handle.writeFile(line, "utf8");
-      this.bytesWritten += size;
+      this.bytesWritten = (this.bytesWritten ?? 0) + Buffer.byteLength(line);
     } finally {
       await handle.close();
     }
@@ -94,5 +117,20 @@ function sanitizeEvent(
     }
     return JSON.parse(redactor.redact(JSON.stringify({ item }))) as Record<string, unknown>;
   }
-  return JSON.parse(redactor.redact(JSON.stringify(event))) as Record<string, unknown>;
+  const serialized = redactor.redact(JSON.stringify(event));
+  if (serialized.length > 8_000) {
+    return { truncated: true, summary: serialized.slice(0, 8_000) };
+  }
+  return JSON.parse(serialized) as Record<string, unknown>;
+}
+
+function isTerminalEvent(event: RecordedRuntimeEvent): boolean {
+  return (
+    event.type === "turn.completed" ||
+    event.type === "turn.failed" ||
+    event.type === "error" ||
+    event.type === "runtime.compatibility" ||
+    event.type === "runtime.cancelled" ||
+    event.type === "runtime.timeout"
+  );
 }

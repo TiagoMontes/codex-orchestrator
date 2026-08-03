@@ -45,18 +45,25 @@ export async function createDiagnosedTaskFixture(repositoryRoot: string, stateHo
     reason: "fixture diagnosis started",
     actor: "system",
   });
+  let task: Task = {
+    ...created.task,
+    status: "diagnosing",
+    baseRef: project.baseRef,
+    baseCommit: sourceCommit,
+    revision: created.task.revision + 1,
+    updatedAt: timestamp,
+  };
+  await taskRepository.update(task, state);
   state = stateMachine.transition(state, {
     nextState: "diagnosed",
     timestamp,
     reason: "fixture diagnosis complete",
     actor: "agent",
   });
-  const task: Task = {
-    ...created.task,
+  task = {
+    ...task,
     status: "diagnosed",
-    baseRef: project.baseRef,
-    baseCommit: sourceCommit,
-    revision: created.task.revision + 1,
+    revision: task.revision + 1,
     updatedAt: timestamp,
   };
   await taskRepository.update(task, state);

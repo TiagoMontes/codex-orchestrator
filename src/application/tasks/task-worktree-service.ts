@@ -41,10 +41,11 @@ export class TaskWorktreeService {
   }
 
   async prepare(taskId: string): Promise<WorktreePreparationReport> {
-    const initialTask = await this.tasks.get(taskId);
+    const initialSnapshot = await this.tasks.getSnapshot(taskId);
+    const initialTask = initialSnapshot.task;
     const lock = await this.repositoryLock.acquireWriter(initialTask.projectId);
     let task = initialTask;
-    let state = await this.tasks.getState(taskId);
+    let state = initialSnapshot.state;
     try {
       if (state.status === "ready-for-implementation" && task.worktree !== undefined) {
         const project = await this.projects.inspect(task.projectId);
@@ -119,6 +120,27 @@ export class TaskWorktreeService {
         baseCommit: resolvedBase,
         branch: taskBranchName(task.id, task.title),
       });
+      try {
+        task = {
+          ...task,
+          worktree: {
+            path: worktree.path,
+            branch: worktree.branch,
+            baseCommit: worktree.baseCommit,
+            createdAt: isoNow(this.clock),
+          },
+          revision: task.revision + 1,
+          updatedAt: isoNow(this.clock),
+        };
+        await this.tasks.update(task);
+      } catch (error) {
+        if (!worktree.reused) {
+          await manager
+            .cleanup(project.gitRoot, worktree, { force: true, deleteBranch: true })
+            .catch(() => undefined);
+        }
+        throw error;
+      }
       if (
         (await git.resolveCommit(project.gitRoot, "HEAD")) !== primaryHead ||
         (await git.statusPorcelain(project.gitRoot)) !== primaryStatus
@@ -137,12 +159,6 @@ export class TaskWorktreeService {
       task = {
         ...task,
         status: "ready-for-implementation",
-        worktree: {
-          path: worktree.path,
-          branch: worktree.branch,
-          baseCommit: worktree.baseCommit,
-          createdAt: completedAt,
-        },
         revision: task.revision + 1,
         updatedAt: completedAt,
       };
@@ -150,14 +166,16 @@ export class TaskWorktreeService {
       return { task, worktree };
     } catch (error) {
       const normalized = toOrchestratorError(error);
-      const persistedState = await this.tasks.getState(taskId);
-      if (persistedState.status === "cancelled") {
+      const persisted = await this.tasks.getSnapshot(taskId);
+      if (persisted.state.status === "cancelled") {
         throw new OrchestratorError("Task worktree preparation was cancelled", {
           code: "CANCELLED",
           resumable: true,
           cause: error,
         });
       }
+      task = persisted.task;
+      state = persisted.state;
       if (state.status === "worktree-preparing") {
         const blockedAt = isoNow(this.clock);
         const nextStatus = taskFailureStatus(normalized);
@@ -198,7 +216,24 @@ export class TaskWorktreeService {
       const manager = new WorktreeManager(this.paths, git);
       const primaryHead = await git.resolveCommit(project.gitRoot, "HEAD");
       const primaryStatus = await git.statusPorcelain(project.gitRoot);
-      const report = await manager.cleanup(project.gitRoot, task.worktree, options);
+      const callerAfterRemove = options.afterRemove;
+      const report = await manager.cleanup(project.gitRoot, task.worktree, {
+        ...options,
+        afterRemove: async () => {
+          task = await this.tasks.get(taskId);
+          if (task.worktree !== undefined) {
+            const { worktree: removedWorktree, ...withoutWorktree } = task;
+            void removedWorktree;
+            task = {
+              ...withoutWorktree,
+              revision: task.revision + 1,
+              updatedAt: isoNow(this.clock),
+            };
+            await this.tasks.update(task);
+          }
+          await callerAfterRemove?.();
+        },
+      });
       if (
         (await git.resolveCommit(project.gitRoot, "HEAD")) !== primaryHead ||
         (await git.statusPorcelain(project.gitRoot)) !== primaryStatus
@@ -207,14 +242,6 @@ export class TaskWorktreeService {
           code: "CONTEXT_INTEGRITY",
         });
       }
-      const { worktree: removedWorktree, ...withoutWorktree } = task;
-      void removedWorktree;
-      task = {
-        ...withoutWorktree,
-        revision: task.revision + 1,
-        updatedAt: isoNow(this.clock),
-      };
-      await this.tasks.update(task);
       return report;
     } finally {
       await lock.release();
@@ -223,7 +250,8 @@ export class TaskWorktreeService {
 
   private scopedGit(task: Task): GitClient {
     return new GitClient({
-      observer: async (record) => this.gitLog.append(task.projectId, task.id, record),
+      observer: async (record) =>
+        this.gitLog.append(task.projectId, task.id, record, { phase: "worktree" }),
     });
   }
 }

@@ -1,9 +1,11 @@
 import { readFile } from "node:fs/promises";
+import { join, relative } from "node:path";
 import type { Project } from "../../domain/project/project.js";
 import type { Task } from "../../domain/task/task.js";
 import { hashJson, sha256 } from "../../shared/hashing.js";
 import { OrchestratorError } from "../../shared/errors.js";
 import type { ContextPack } from "./context-pack.js";
+import { ProjectMetadataScanner } from "../../application/projects/project-metadata-scanner.js";
 
 export type CurrentContextIntegrity = {
   task: Task;
@@ -18,7 +20,7 @@ export type CurrentContextIntegrity = {
 export class ContextIntegrityValidator {
   assertValid(pack: ContextPack, current: CurrentContextIntegrity): void {
     const mismatches: string[] = [];
-    if (pack.contextPackVersion !== 1) mismatches.push("context-pack version");
+    if (pack.contextPackVersion !== 2) mismatches.push("context-pack version");
     if (pack.task.id !== current.task.id || pack.task.hash !== hashJson(current.task))
       mismatches.push("task hash");
     if (pack.projectId !== current.project.id) mismatches.push("project ID");
@@ -59,22 +61,33 @@ export class ContextIntegrityValidator {
   async assertLiveInstructionFiles(
     pack: ContextPack,
     current: CurrentContextIntegrity,
+    instructionRoot = current.project.gitRoot,
   ): Promise<void> {
     this.assertValid(pack, current);
-    const expected = new Map(pack.instructionHashes.map((item) => [item.path, item.sha256]));
-    const stale: string[] = [];
-    await Promise.all(
-      current.project.instructionFiles.map(async (item) => {
-        const actual = await readFile(item.path)
-          .then(sha256)
-          .catch(() => undefined);
-        if (actual === undefined || actual !== expected.get(item.relativePath))
-          stale.push(item.relativePath);
-      }),
+    const expected = new Map(
+      pack.instructionHashes.map((item) => [normalizeRelative(item.path), item.sha256]),
     );
+    const stale: string[] = [];
+    const liveMetadata = await new ProjectMetadataScanner().scan(instructionRoot);
+    const liveInstructions = new Map(
+      liveMetadata.instructionFiles.map((item) => [
+        normalizeRelative(item.relativePath),
+        item.sha256,
+      ]),
+    );
+    for (const [path, expectedHash] of expected) {
+      if (liveInstructions.get(path) !== expectedHash) stale.push(path);
+    }
+    for (const path of liveInstructions.keys()) {
+      if (!expected.has(path)) stale.push(path);
+    }
     await Promise.all(
       pack.selectedSkills.map(async (skill) => {
-        const actual = await readFile(skill.path)
+        const path =
+          skill.source === "project"
+            ? join(instructionRoot, relative(current.project.gitRoot, skill.path))
+            : skill.path;
+        const actual = await readFile(path)
           .then(sha256)
           .catch(() => undefined);
         if (actual === undefined || actual !== skill.sha256) stale.push(`skill:${skill.name}`);
@@ -90,4 +103,8 @@ export class ContextIntegrityValidator {
       );
     }
   }
+}
+
+function normalizeRelative(path: string): string {
+  return path.split(/[\\/]/u).join("/");
 }

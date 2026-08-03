@@ -75,6 +75,16 @@ export function registerTaskQueryCommands(
         output.write(
           `Attempts: ${report.attempts.length}; retries: ${report.retryCount}; threads: ${report.threads.length}`,
         );
+        for (const retry of report.retries) {
+          output.write(
+            `Retry ${retry.phase} #${retry.attemptNumber}: ${retry.reason} (${retry.executionId})`,
+          );
+        }
+        for (const rotation of report.contextRotations) {
+          output.write(
+            `Context rotation ${rotation.phase}: ${rotation.reasons.join("; ")}${rotation.compacted ? "; compacted" : ""}`,
+          );
+        }
         output.write(
           `Usage: ${report.usage.totals.totalTokens} tokens; calls: ${report.usage.totalCalls}`,
         );

@@ -195,6 +195,7 @@ function createReporter(seeded: ImplementedFixture): TaskReportingService {
     new VerificationFileRepository(seeded.paths),
     new ReviewFileRepository(seeded.paths),
     new DecisionFileRepository(seeded.paths),
+    seeded.projects,
   );
 }
 

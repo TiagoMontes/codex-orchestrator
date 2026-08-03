@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { access, constants, readFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { z } from "zod";
 import type {
@@ -19,10 +19,16 @@ import type { Task } from "../../domain/task/task.js";
 import type { UsageLedgerDocument } from "../../domain/usage/usage-ledger.js";
 import type { VerificationResult } from "../../domain/verification/verification.js";
 import { reviewResultSchema } from "../../domain/review/review.js";
-import type { CodexRuntime } from "../../infrastructure/codex/codex-runtime.js";
+import type {
+  CodexProgressObserver,
+  CodexRuntime,
+} from "../../infrastructure/codex/codex-runtime.js";
 import { DiffService } from "../../infrastructure/git/diff-service.js";
 import { GitClient } from "../../infrastructure/git/git-client.js";
-import { GitCommandLog } from "../../infrastructure/git/git-command-log.js";
+import {
+  GitCommandLog,
+  type GitCommandCorrelation,
+} from "../../infrastructure/git/git-command-log.js";
 import { RepositoryLock } from "../../infrastructure/git/repository-lock.js";
 import { WorktreeManager } from "../../infrastructure/git/worktree-manager.js";
 import { AtomicFileWriter } from "../../infrastructure/persistence/atomic-file-writer.js";
@@ -44,7 +50,9 @@ import { stableJson } from "../../shared/hashing.js";
 import { ContextBudgetManager } from "../../orchestration/context/context-budget-manager.js";
 import { ContextIntegrityValidator } from "../../orchestration/context/context-integrity-validator.js";
 import { ContextPackBuilder } from "../../orchestration/context/context-pack-builder.js";
+import { assertStructuredOutputBounded } from "../../orchestration/context/structured-output-bound.js";
 import { StopPolicy } from "../../orchestration/engine/stop-policy.js";
+import { failureSignature } from "../../orchestration/engine/failure-signature.js";
 import { TaskStateMachine } from "../../orchestration/engine/state-machine.js";
 import { EscalationPolicy } from "../../orchestration/routing/escalation-policy.js";
 import { ModelRouter, type RoutingOverrides } from "../../orchestration/routing/model-router.js";
@@ -55,6 +63,15 @@ import { VerificationService } from "./verification-service.js";
 import { SkillRegistry } from "../skills/skill-registry.js";
 import { PersistedTaskCancellation } from "./persisted-task-cancellation.js";
 import { executionFailureStatus, taskFailureStatus } from "./task-failure-policy.js";
+import {
+  assertRetryHasNewEvidence,
+  executionInputFingerprint,
+} from "./execution-input-fingerprint.js";
+import { verificationPolicyHash } from "./verification-policy.js";
+import { semanticEvidenceInput } from "../../orchestration/context/evidence-fingerprint.js";
+import { reviewCorrectionCheckpointSchema } from "./review-correction-checkpoint.js";
+import { projectAtWorkingRoot } from "../projects/project-working-copy.js";
+import { writerRuntimeCheckpointSchema } from "./writer-runtime-checkpoint.js";
 
 export type TaskRunOverrides = {
   profile?: ExecutionProfile;
@@ -66,6 +83,7 @@ export type TaskRunOverrides = {
   allowNetwork?: boolean;
   baseRef?: string;
   timeoutMs?: number;
+  progress?: CodexProgressObserver;
   abortSignal?: AbortSignal;
 };
 
@@ -141,18 +159,19 @@ export class TaskRunService implements TaskRunner {
     const callerSignal = overrides.abortSignal;
     const cancellation = new PersistedTaskCancellation(this.tasks, taskId, callerSignal);
     overrides = { ...overrides, abortSignal: cancellation.signal };
-    let state = await this.tasks.getState(task.id);
+    let state = (await this.tasks.getSnapshot(task.id)).state;
     let primarySnapshot: { head: string; status: string } | undefined;
     let activeReservationId: string | undefined;
     try {
-      task = await this.tasks.get(taskId);
+      ({ task, state } = await this.tasks.getSnapshot(taskId));
       const project = await this.projects.inspect(task.projectId);
       const diagnosis = await this.diagnoses.read(project.id, task.id);
       assertTaskIntegrity(task, diagnosis);
       const baseCommit = task.worktree.baseCommit;
       const config = applyRunOverrides(await this.configService.load(), overrides, task.profile);
       const profile = overrides.profile ?? task.profile;
-      const git = this.scopedGit(task);
+      const gitCorrelation: GitCommandCorrelation = { phase: "implementation" };
+      const git = this.scopedGit(task, gitCorrelation);
       const manager = new WorktreeManager(this.paths, git);
       const worktree = await manager.inspect(project.gitRoot, task.worktree.path);
       if (
@@ -165,12 +184,6 @@ export class TaskRunService implements TaskRunner {
         });
       }
       const primaryHead = await git.resolveCommit(project.gitRoot, "HEAD");
-      if (primaryHead !== diagnosis.sourceCommit) {
-        throw new OrchestratorError("Primary source commit changed after diagnosis", {
-          code: "CONTEXT_INTEGRITY",
-          resumable: true,
-        });
-      }
       if (overrides.baseRef !== undefined) {
         const overrideCommit = await git.resolveCommit(project.gitRoot, overrides.baseRef);
         if (overrideCommit !== diagnosis.sourceCommit) {
@@ -194,27 +207,67 @@ export class TaskRunService implements TaskRunner {
         this.clock,
       );
       const allAttempts = await this.executions.list(project.id, task.id);
+      const reviewCorrectionAttempts = allAttempts.filter(
+        (attempt) =>
+          attempt.phase === "correction" && attempt.contextPackPath.includes("/review-correction-"),
+      );
       const existingAttempts = allAttempts.filter(
         (attempt) =>
           (attempt.phase === "implementation" || attempt.phase === "correction") &&
           !attempt.contextPackPath.includes("/review-correction-"),
       );
+      const writerAttempts = [...existingAttempts, ...reviewCorrectionAttempts].sort(
+        (left, right) =>
+          (left.sequence ?? Number.POSITIVE_INFINITY) -
+            (right.sequence ?? Number.POSITIVE_INFINITY) ||
+          left.startedAt.localeCompare(right.startedAt) ||
+          left.id.localeCompare(right.id),
+      );
+      const recoveredReviewCorrection = await this.recoverWriterCheckpoint({
+        task,
+        state,
+        project,
+        diagnosis,
+        config,
+        git,
+        diffService,
+        verificationService,
+        primarySnapshot,
+        attempts: reviewCorrectionAttempts,
+        worktreePath: worktree.path,
+        baseCommit,
+        ...(overrides.abortSignal === undefined ? {} : { abortSignal: overrides.abortSignal }),
+      });
+      if (recoveredReviewCorrection !== undefined) return recoveredReviewCorrection;
+      const recovered = await this.recoverWriterCheckpoint({
+        task,
+        state,
+        project,
+        diagnosis,
+        config,
+        git,
+        diffService,
+        verificationService,
+        primarySnapshot,
+        attempts: existingAttempts,
+        worktreePath: worktree.path,
+        baseCommit,
+        ...(overrides.abortSignal === undefined ? {} : { abortSignal: overrides.abortSignal }),
+      });
+      if (recovered !== undefined) return recovered;
       const seenFailureSignatures = new Set(
-        existingAttempts
+        writerAttempts
           .map((attempt) => attempt.failureSignature)
           .filter((signature): signature is string => signature !== undefined),
       );
-      const priorFailureAttempts = existingAttempts.filter(
-        (attempt) => attempt.failureSignature !== undefined,
-      );
       const maximumAttempts = config.profiles[profile].maxImplementationAttempts;
-      if (priorFailureAttempts.length >= maximumAttempts) {
+      if (writerAttempts.length >= maximumAttempts) {
         await this.stopTask(task, state, "attempt_limit_reached");
       }
       const evidence = await this.evidenceRepository.read(project.id, task.id);
       const persistedOverrides = Object.fromEntries(
         Object.entries(overrides).filter(
-          ([key, value]) => key !== "abortSignal" && value !== undefined,
+          ([key, value]) => key !== "abortSignal" && key !== "progress" && value !== undefined,
         ),
       );
       if (Object.keys(persistedOverrides).length > 0) {
@@ -261,6 +314,11 @@ export class TaskRunService implements TaskRunner {
         });
       }
       if (parallelPlan.mode === "parallel") {
+        const readerProject = await projectAtWorkingRoot(
+          project,
+          worktree.path,
+          diagnosis.sourceCommit,
+        );
         const parallel = await new ParallelReadCoordinator(
           config,
           this.paths,
@@ -272,7 +330,7 @@ export class TaskRunService implements TaskRunner {
           this.clock,
         ).run({
           task,
-          project,
+          project: readerProject,
           sourceCommit: diagnosis.sourceCommit,
           profile,
           workstreams: parallelPlan.workstreams,
@@ -282,6 +340,7 @@ export class TaskRunService implements TaskRunner {
             ...(overrides.model === undefined ? {} : { model: overrides.model }),
             ...(overrides.reasoning === undefined ? {} : { reasoning: overrides.reasoning }),
             ...(overrides.timeoutMs === undefined ? {} : { timeoutMs: overrides.timeoutMs }),
+            ...(overrides.progress === undefined ? {} : { progress: overrides.progress }),
             ...(overrides.abortSignal === undefined ? {} : { abortSignal: overrides.abortSignal }),
           },
         });
@@ -289,18 +348,35 @@ export class TaskRunService implements TaskRunner {
         evidence.splice(0, evidence.length, ...consolidated);
       }
       let latestFailure: string | null = null;
-      const interruptedReviewCorrection = allAttempts.some(
-        (attempt) =>
-          attempt.phase === "correction" &&
-          attempt.contextPackPath.includes("/review-correction-") &&
-          attempt.status !== "succeeded",
-      );
-      if (priorFailureAttempts.length > 0) {
-        const priorVerification = await this.verificationRepository.read(project.id, task.id);
+      let pendingReview: z.infer<typeof reviewResultSchema> | undefined;
+      try {
+        const candidate = await this.store.read(
+          join(this.paths.taskDirectory(project.id, task.id), "review.json"),
+          reviewResultSchema,
+        );
+        if (candidate.verdict === "changes-requested") pendingReview = candidate;
+      } catch (error) {
+        if (!isMissingStateDocument(error)) throw error;
+      }
+      const interruptedReviewCorrection =
+        allAttempts.some(
+          (attempt) =>
+            attempt.phase === "correction" &&
+            attempt.contextPackPath.includes("/review-correction-") &&
+            attempt.status !== "succeeded",
+        ) || pendingReview !== undefined;
+      const latestWriterAttempt = writerAttempts.at(-1);
+      if (latestWriterAttempt !== undefined && latestWriterAttempt.status !== "succeeded") {
+        const priorVerification = await this.readAttemptVerification(
+          project.id,
+          task.id,
+          latestWriterAttempt.id,
+        );
         if (
-          priorVerification.taskId !== task.id ||
-          priorVerification.sourceCommit !== diagnosis.sourceCommit ||
-          priorVerification.overallStatus === "passed"
+          priorVerification !== undefined &&
+          (priorVerification.taskId !== task.id ||
+            priorVerification.sourceCommit !== diagnosis.sourceCommit ||
+            priorVerification.overallStatus === "passed")
         ) {
           throw new OrchestratorError(
             "Resume is missing exact prior verification failure evidence",
@@ -309,17 +385,39 @@ export class TaskRunService implements TaskRunner {
             },
           );
         }
-        latestFailure = priorVerification.commands
-          .filter((command) => command.status !== "passed")
-          .map((command) => `${command.name}: ${command.excerpt}`)
-          .join("\n")
-          .slice(-config.context.maxExcerptCharacters);
+        if (priorVerification !== undefined) {
+          latestFailure =
+            priorVerification.commands
+              .filter((command) => command.status !== "passed")
+              .map((command) => `${command.name}: ${command.excerpt}`)
+              .join("\n")
+              .slice(-config.context.maxExcerptCharacters) || priorVerification.overallStatus;
+        } else if (latestWriterAttempt.contextPackPath.includes("/review-correction-")) {
+          if (
+            pendingReview === undefined ||
+            pendingReview.taskId !== task.id ||
+            pendingReview.sourceCommit !== diagnosis.sourceCommit ||
+            pendingReview.verdict !== "changes-requested"
+          ) {
+            throw new OrchestratorError(
+              "Interrupted review correction has no verification or compatible findings",
+              { code: "CONTEXT_INTEGRITY" },
+            );
+          }
+          latestFailure = stableJson({
+            reviewVerdict: pendingReview.verdict,
+            findings: pendingReview.findings,
+            acceptanceCriteriaAssessment: pendingReview.acceptanceCriteriaAssessment.filter(
+              (item) => item.status !== "met",
+            ),
+          }).slice(-config.context.maxExcerptCharacters);
+        } else {
+          latestFailure = latestWriterAttempt.error?.message ?? latestWriterAttempt.status;
+        }
       } else if (interruptedReviewCorrection) {
-        const priorReview = await this.store.read(
-          join(this.paths.taskDirectory(project.id, task.id), "review.json"),
-          reviewResultSchema,
-        );
+        const priorReview = pendingReview;
         if (
+          priorReview === undefined ||
           priorReview.taskId !== task.id ||
           priorReview.sourceCommit !== diagnosis.sourceCommit ||
           priorReview.verdict !== "changes-requested"
@@ -348,7 +446,7 @@ export class TaskRunService implements TaskRunner {
         "Implementation started",
       ));
       for (
-        let attemptOrdinal = priorFailureAttempts.length + 1;
+        let attemptOrdinal = writerAttempts.length + 1;
         attemptOrdinal <= maximumAttempts;
         attemptOrdinal += 1
       ) {
@@ -360,12 +458,23 @@ export class TaskRunService implements TaskRunner {
         }
         await this.assertPrimaryUnchanged(git, project.gitRoot, primarySnapshot);
         const executionId = randomUUID();
-        const attemptNumber =
-          existingAttempts.length + (attemptOrdinal - priorFailureAttempts.length);
+        const attemptNumber = attemptOrdinal;
         const phase =
           attemptOrdinal === 1 && !interruptedReviewCorrection ? "implementation" : "correction";
+        gitCorrelation.phase = phase;
+        gitCorrelation.executionId = executionId;
+        delete gitCorrelation.threadId;
         const worktreeHead = await git.resolveCommit(worktree.path, "HEAD");
-        const selectedSkills = await this.skillRegistry.select({ phase, task, project });
+        const phaseProject = await projectAtWorkingRoot(
+          project,
+          worktree.path,
+          diagnosis.sourceCommit,
+        );
+        const selectedSkills = await this.skillRegistry.select({
+          phase,
+          task,
+          project: phaseProject,
+        });
         const contextPack = new ContextPackBuilder(config).build({
           phase,
           objective:
@@ -373,7 +482,7 @@ export class TaskRunService implements TaskRunner {
               ? `Implement ${task.title} in the isolated worktree`
               : `Correct ${task.title} using only the latest deterministic failure`,
           task,
-          project,
+          project: phaseProject,
           sourceCommit: diagnosis.sourceCommit,
           worktreeHead,
           diagnosis,
@@ -388,13 +497,17 @@ export class TaskRunService implements TaskRunner {
           selectedSkills,
           outputSchema: toJsonSchema(implementationResultSchema),
         });
-        await this.integrity.assertLiveInstructionFiles(contextPack, {
-          task,
-          project,
-          sourceCommit: diagnosis.sourceCommit,
-          worktreeHead,
-          diagnosis,
-        });
+        await this.integrity.assertLiveInstructionFiles(
+          contextPack,
+          {
+            task,
+            project: phaseProject,
+            sourceCommit: diagnosis.sourceCommit,
+            worktreeHead,
+            diagnosis,
+          },
+          worktree.path,
+        );
         const contextPackPath = join(
           this.paths.taskDirectory(project.id, task.id),
           "context-packs",
@@ -445,6 +558,34 @@ export class TaskRunService implements TaskRunner {
           overrides: routingOverrides,
         });
         priorDecision = modelDecision;
+        const inputFingerprint = executionInputFingerprint({
+          phase,
+          sourceCommit: diagnosis.sourceCommit,
+          worktreeHead,
+          worktreeDiff: await git.diffPatch(worktree.path, baseCommit),
+          task: implementationTaskInput(task),
+          diagnosis,
+          evidence: evidence.map(semanticEvidenceInput),
+          latestFailure,
+          selectedSkills: selectedSkills.map(
+            ({ name, source, sha256: skillSha256, instructionsSha256 }) => ({
+              name,
+              source,
+              sha256: skillSha256,
+              instructionsSha256,
+            }),
+          ),
+          instructions: phaseProject.instructionFiles.map(({ relativePath, sha256 }) => ({
+            relativePath,
+            sha256,
+          })),
+          verificationPolicyHash: verificationPolicyHash(project),
+        });
+        assertRetryHasNewEvidence(
+          [...writerAttempts, ...runAttempts],
+          inputFingerprint,
+          "Implementation",
+        );
         const admission = await new ContextBudgetManager(config, this.usage).admitAndReserve({
           projectId: project.id,
           taskId: task.id,
@@ -460,7 +601,7 @@ export class TaskRunService implements TaskRunner {
           summary: `${modelDecision.model} / ${modelDecision.reasoning} selected for ${phase}`,
           details: { ...modelDecision, attemptNumber },
         });
-        if ((overrides.allowNetwork ?? false) && attemptNumber === existingAttempts.length + 1) {
+        if ((overrides.allowNetwork ?? false) && attemptNumber === writerAttempts.length + 1) {
           await this.decisions.append(project.id, task.id, {
             kind: "network-opt-in",
             summary: "Network access explicitly enabled for task run",
@@ -478,6 +619,8 @@ export class TaskRunService implements TaskRunner {
           taskId: task.id,
           phase,
           attemptNumber,
+          reservationId: admission.reservation.id,
+          inputFingerprint,
           modelDecision,
           sandboxMode: "workspace-write",
           contextPackPath,
@@ -487,6 +630,7 @@ export class TaskRunService implements TaskRunner {
           eventsPath,
         };
         await this.executions.save(project.id, execution);
+        let callStarted = false;
         try {
           const prompt = await this.promptLoader.render(
             phase === "implementation" ? "implementation.prompt.md" : "correction.prompt.md",
@@ -498,6 +642,9 @@ export class TaskRunService implements TaskRunner {
               CONTEXT_PACK: stableJson(contextPack),
             },
           );
+          execution = { ...execution, callStartedAt: isoNow(this.clock) };
+          await this.executions.save(project.id, execution);
+          callStarted = true;
           const runtimeResult = await this.runtime.runStructured({
             role: phase === "implementation" ? "implementer" : "corrector",
             prompt,
@@ -511,8 +658,13 @@ export class TaskRunService implements TaskRunner {
             outputValidator: implementationResultSchema,
             timeoutMs: overrides.timeoutMs ?? config.runtime.defaultTimeoutSeconds * 1_000,
             eventsPath,
+            additionalAllowedEnvironmentNames: phaseProject.environmentPolicy.allowlist,
+            explicitSecretEnvironmentExceptions: phaseProject.environmentPolicy.secretExceptions,
+            ...(overrides.progress === undefined ? {} : { progress: overrides.progress }),
             ...(overrides.abortSignal === undefined ? {} : { abortSignal: overrides.abortSignal }),
           });
+          gitCorrelation.threadId = runtimeResult.threadId;
+          assertStructuredOutputBounded(runtimeResult.output, config);
           const implementation = implementationResultSchema.parse(runtimeResult.output);
           if (implementation.taskId !== task.id) {
             throw new OrchestratorError("Implementation result task identity mismatch", {
@@ -523,6 +675,26 @@ export class TaskRunService implements TaskRunner {
             this.paths.taskDirectory(project.id, task.id),
             "runs",
             `${executionId}.implementation.json`,
+          );
+          const runtimeCompletedAt = isoNow(this.clock);
+          await this.store.write(
+            this.writerRuntimeCheckpointPath(project.id, task.id, executionId),
+            writerRuntimeCheckpointSchema.parse({
+              schemaVersion: 1,
+              executionId,
+              taskId: task.id,
+              sourceCommit: diagnosis.sourceCommit,
+              baseCommit,
+              kind: "implementation",
+              inputFingerprint,
+              modelDecision,
+              implementation,
+              usage: runtimeResult.usage,
+              threadId: runtimeResult.threadId,
+              runtimeAttempts: runtimeResult.runtimeAttempts,
+              resultArtifactPath: implementationPath,
+              completedAt: runtimeCompletedAt,
+            }),
           );
           await this.store.write(implementationPath, implementation);
           await this.usage.commitReservation({
@@ -571,14 +743,37 @@ export class TaskRunService implements TaskRunner {
             `Deterministic verification started for diff ${diff.diffHash}`,
             executionId,
           ));
-          const verification = await verificationService.verify({
-            task,
-            project,
-            worktreePath: worktree.path,
-            diff,
-            executionId,
-            ...(overrides.abortSignal === undefined ? {} : { abortSignal: overrides.abortSignal }),
-          });
+          const currentProject = await this.projects.inspect(project.id);
+          if (verificationPolicyHash(currentProject) !== verificationPolicyHash(project)) {
+            throw new OrchestratorError(
+              "Verification policy changed during implementation; rerun with fresh context",
+              { code: "CONTEXT_INTEGRITY", resumable: true },
+            );
+          }
+          let verification: Awaited<ReturnType<VerificationService["verify"]>>;
+          try {
+            verification = await verificationService.verify({
+              task,
+              project: currentProject,
+              worktreePath: worktree.path,
+              diff,
+              executionId,
+              ...(overrides.abortSignal === undefined
+                ? {}
+                : { abortSignal: overrides.abortSignal }),
+            });
+          } finally {
+            await this.assertPrimaryUnchanged(git, project.gitRoot, primarySnapshot);
+          }
+          if (
+            verification.result.policyHash !==
+            verificationPolicyHash(await this.projects.inspect(project.id))
+          ) {
+            throw new OrchestratorError(
+              "Verification policy changed while deterministic commands were running",
+              { code: "CONTEXT_INTEGRITY", resumable: true },
+            );
+          }
           for (const item of verification.evidence) {
             if (!evidence.some((existing) => existing.id === item.id)) evidence.push(item);
           }
@@ -602,7 +797,6 @@ export class TaskRunService implements TaskRunner {
           await this.executions.save(project.id, execution);
           runAttempts.push(execution);
           if (verification.result.overallStatus === "passed") {
-            await this.assertPrimaryUnchanged(git, project.gitRoot, primarySnapshot);
             ({ task, state } = await this.transition(
               task,
               state,
@@ -655,9 +849,17 @@ export class TaskRunService implements TaskRunner {
           ));
         } catch (error) {
           if (activeReservationId !== undefined) {
-            await this.usage
-              .releaseReservation(project.id, task.id, activeReservationId)
-              .catch(() => undefined);
+            await (
+              !callStarted
+                ? this.usage.releaseReservation(project.id, task.id, activeReservationId)
+                : this.usage.commitFailedReservation({
+                    projectId: project.id,
+                    taskId: task.id,
+                    reservationId: activeReservationId,
+                    model: modelDecision.model,
+                    reasoning: modelDecision.reasoning,
+                  })
+            ).catch(() => undefined);
             activeReservationId = undefined;
           }
           let normalized = toOrchestratorError(error);
@@ -705,8 +907,7 @@ export class TaskRunService implements TaskRunner {
           .releaseReservation(task.projectId, task.id, activeReservationId)
           .catch(() => undefined);
       }
-      state = await this.tasks.getState(task.id);
-      task = await this.tasks.get(task.id);
+      ({ task, state } = await this.tasks.getSnapshot(task.id));
       if (state.status === "cancelled" && normalized.code !== "CANCELLED") {
         normalized = new OrchestratorError("Task run was cancelled", {
           code: "CANCELLED",
@@ -720,15 +921,329 @@ export class TaskRunService implements TaskRunner {
       }
       throw normalized;
     } finally {
-      cancellation.dispose(callerSignal);
+      await cancellation.dispose(callerSignal);
       await writerLock.release();
     }
   }
 
-  private scopedGit(task: Task): GitClient {
+  private scopedGit(task: Task, correlation: GitCommandCorrelation = {}): GitClient {
     return new GitClient({
-      observer: async (record) => this.gitLog.append(task.projectId, task.id, record),
+      observer: async (record) => this.gitLog.append(task.projectId, task.id, record, correlation),
     });
+  }
+
+  private async recoverWriterCheckpoint(input: {
+    task: Task;
+    state: Awaited<ReturnType<TaskFileRepository["getState"]>>;
+    project: Awaited<ReturnType<ProjectManager["inspect"]>>;
+    diagnosis: Diagnosis;
+    config: AppConfig;
+    git: GitClient;
+    diffService: DiffService;
+    verificationService: VerificationService;
+    primarySnapshot: { head: string; status: string };
+    attempts: readonly ExecutionAttempt[];
+    worktreePath: string;
+    baseCommit: string;
+    abortSignal?: AbortSignal;
+  }): Promise<TaskRunReport | undefined> {
+    const attempt = input.attempts.at(-1);
+    if (attempt === undefined) return undefined;
+    if (["failed", "blocked", "cancelled"].includes(attempt.status)) return undefined;
+    const isReviewCorrection = attempt.contextPackPath.includes("/review-correction-");
+    const implementationFilename = isReviewCorrection
+      ? `${attempt.id}.review-correction.json`
+      : `${attempt.id}.implementation.json`;
+    const implementationPath = join(
+      this.paths.taskDirectory(input.project.id, input.task.id),
+      "runs",
+      implementationFilename,
+    );
+    let runtimeCheckpoint: z.infer<typeof writerRuntimeCheckpointSchema> | undefined;
+    try {
+      runtimeCheckpoint = await this.store.read(
+        this.writerRuntimeCheckpointPath(input.project.id, input.task.id, attempt.id),
+        writerRuntimeCheckpointSchema,
+      );
+    } catch (error) {
+      if (!isMissingStateDocument(error)) throw error;
+    }
+    let implementation: z.infer<typeof implementationResultSchema>;
+    try {
+      await access(implementationPath, constants.R_OK);
+      implementation = await this.store.read(implementationPath, implementationResultSchema);
+    } catch {
+      if (runtimeCheckpoint === undefined) return undefined;
+      implementation = runtimeCheckpoint.implementation;
+      await this.store.write(implementationPath, implementation);
+    }
+    if (implementation.taskId !== input.task.id) {
+      throw new OrchestratorError("Recovered implementation task identity mismatch", {
+        code: "CONTEXT_INTEGRITY",
+      });
+    }
+    if (runtimeCheckpoint !== undefined) {
+      if (
+        runtimeCheckpoint.executionId !== attempt.id ||
+        runtimeCheckpoint.taskId !== input.task.id ||
+        runtimeCheckpoint.sourceCommit !== input.diagnosis.sourceCommit ||
+        runtimeCheckpoint.baseCommit !== input.baseCommit ||
+        runtimeCheckpoint.kind !== (isReviewCorrection ? "review-correction" : "implementation") ||
+        runtimeCheckpoint.inputFingerprint !== attempt.inputFingerprint ||
+        stableJson(runtimeCheckpoint.modelDecision) !== stableJson(attempt.modelDecision) ||
+        stableJson(runtimeCheckpoint.implementation) !== stableJson(implementation) ||
+        runtimeCheckpoint.resultArtifactPath !== implementationPath
+      ) {
+        throw new OrchestratorError("Writer runtime checkpoint is incompatible", {
+          code: "CONTEXT_INTEGRITY",
+        });
+      }
+      if (attempt.reservationId === undefined) {
+        throw new OrchestratorError("Writer runtime checkpoint has no usage reservation", {
+          code: "CONTEXT_INTEGRITY",
+        });
+      }
+      await this.usage.commitReservation({
+        projectId: input.project.id,
+        taskId: input.task.id,
+        reservationId: attempt.reservationId,
+        model: runtimeCheckpoint.modelDecision.model,
+        reasoning: runtimeCheckpoint.modelDecision.reasoning,
+        usage: runtimeCheckpoint.usage,
+        agentCalls: runtimeCheckpoint.runtimeAttempts,
+        threadId: runtimeCheckpoint.threadId,
+      });
+    }
+    let correctionCheckpoint: z.infer<typeof reviewCorrectionCheckpointSchema> | undefined;
+    if (isReviewCorrection) {
+      const checkpointPath = join(
+        this.paths.taskDirectory(input.project.id, input.task.id),
+        "runs",
+        `${attempt.id}.review-correction-checkpoint.json`,
+      );
+      try {
+        correctionCheckpoint = await this.store.read(
+          checkpointPath,
+          reviewCorrectionCheckpointSchema,
+        );
+      } catch (error) {
+        if (isMissingStateDocument(error)) return undefined;
+        throw error;
+      }
+      if (
+        correctionCheckpoint.executionId !== attempt.id ||
+        correctionCheckpoint.taskId !== input.task.id ||
+        correctionCheckpoint.sourceCommit !== input.diagnosis.sourceCommit ||
+        correctionCheckpoint.baseCommit !== input.baseCommit ||
+        correctionCheckpoint.inputFingerprint !== attempt.inputFingerprint ||
+        stableJson(correctionCheckpoint.modelDecision) !== stableJson(attempt.modelDecision) ||
+        stableJson(correctionCheckpoint.implementation) !== stableJson(implementation) ||
+        correctionCheckpoint.resultArtifactPath !== implementationPath
+      ) {
+        throw new OrchestratorError("Review-correction checkpoint is incompatible", {
+          code: "CONTEXT_INTEGRITY",
+        });
+      }
+      if (attempt.reservationId === undefined) {
+        throw new OrchestratorError("Review-correction checkpoint has no usage reservation", {
+          code: "CONTEXT_INTEGRITY",
+        });
+      }
+      await this.usage.commitReservation({
+        projectId: input.project.id,
+        taskId: input.task.id,
+        reservationId: attempt.reservationId,
+        model: correctionCheckpoint.modelDecision.model,
+        reasoning: correctionCheckpoint.modelDecision.reasoning,
+        usage: correctionCheckpoint.usage,
+        agentCalls: correctionCheckpoint.runtimeAttempts,
+        threadId: correctionCheckpoint.threadId,
+      });
+    }
+    if ((await input.git.changedFiles(input.worktreePath, input.baseCommit)).length === 0) {
+      return undefined;
+    }
+    const diff = await input.diffService.capture({
+      projectId: input.project.id,
+      taskId: input.task.id,
+      worktreePath: input.worktreePath,
+      sourceCommit: input.diagnosis.sourceCommit,
+      baseCommit: input.baseCommit,
+    });
+    if (
+      correctionCheckpoint !== undefined &&
+      correctionCheckpoint.postCorrectionDiffHash !== diff.diffHash
+    ) {
+      throw new OrchestratorError("Live diff does not match the review-correction checkpoint", {
+        code: "CONTEXT_INTEGRITY",
+        resumable: true,
+      });
+    }
+    if (
+      correctionCheckpoint !== undefined &&
+      correctionCheckpoint.preCorrectionDiffHash === correctionCheckpoint.postCorrectionDiffHash
+    ) {
+      await this.executions.save(input.project.id, {
+        ...attempt,
+        completedAt: correctionCheckpoint.completedAt,
+        status: "blocked",
+        threadId: correctionCheckpoint.threadId,
+        usage: correctionCheckpoint.usage,
+        resultArtifactPath: implementationPath,
+        error: {
+          name: "OrchestratorError",
+          message: "review_correction_produced_no_new_diff",
+          code: "REVIEW_CHANGES",
+          resumable: true,
+        },
+      });
+      await this.stopTask(input.task, input.state, "review_correction_produced_no_new_diff");
+    }
+    await this.preserveAttemptPatch(diff, attempt.id);
+    let verification = await this.readAttemptVerification(
+      input.project.id,
+      input.task.id,
+      attempt.id,
+    );
+    const currentProject = await this.projects.inspect(input.project.id);
+    const currentPolicyHash = verificationPolicyHash(currentProject);
+    if (
+      verification !== undefined &&
+      (verification.taskId !== input.task.id ||
+        verification.sourceCommit !== input.diagnosis.sourceCommit ||
+        verification.diffHash !== diff.diffHash)
+    ) {
+      throw new OrchestratorError("Recovered verification does not match the live writer diff", {
+        code: "CONTEXT_INTEGRITY",
+      });
+    }
+    if (verification?.policyHash !== currentPolicyHash) verification = undefined;
+    let recoveredFailureSignature =
+      verification === undefined || verification.overallStatus === "passed"
+        ? undefined
+        : failureSignature({
+            phase: "verification",
+            sourceCommit: verification.sourceCommit,
+            diffHash: verification.diffHash,
+            commands: verification.commands,
+            worktreePath: input.worktreePath,
+          });
+
+    let task = input.task;
+    let state = input.state;
+    ({ task, state } = await this.transition(
+      task,
+      state,
+      "implementing",
+      "Recovered persisted writer output without another agent call",
+      attempt.id,
+    ));
+    ({ task, state } = await this.transition(
+      task,
+      state,
+      "verifying",
+      `Recovered writer diff ${diff.diffHash} for deterministic verification`,
+      attempt.id,
+    ));
+    if (verification === undefined) {
+      try {
+        const verificationReport = await input.verificationService.verify({
+          task,
+          project: currentProject,
+          worktreePath: input.worktreePath,
+          diff,
+          executionId: attempt.id,
+          ...(input.abortSignal === undefined ? {} : { abortSignal: input.abortSignal }),
+        });
+        verification = verificationReport.result;
+        recoveredFailureSignature = verificationReport.failureSignature;
+      } finally {
+        await this.assertPrimaryUnchanged(input.git, input.project.gitRoot, input.primarySnapshot);
+      }
+    }
+    if (
+      verification.policyHash !==
+      verificationPolicyHash(await this.projects.inspect(input.project.id))
+    ) {
+      throw new OrchestratorError("Verification policy changed during checkpoint recovery", {
+        code: "CONTEXT_INTEGRITY",
+        resumable: true,
+      });
+    }
+    const { error: priorError, ...withoutError } = attempt;
+    void priorError;
+    const usageEntry = (await this.usage.read(input.project.id, input.task.id)).entries.find(
+      (entry) => entry.reservationId === attempt.reservationId,
+    );
+    const completedAttempt: ExecutionAttempt = {
+      ...withoutError,
+      completedAt: isoNow(this.clock),
+      status:
+        verification.overallStatus === "passed"
+          ? "succeeded"
+          : verification.overallStatus === "blocked"
+            ? "blocked"
+            : "failed",
+      resultArtifactPath: implementationPath,
+      ...(attempt.threadId === undefined && usageEntry?.threadId !== undefined
+        ? { threadId: usageEntry.threadId }
+        : {}),
+      ...(attempt.usage === undefined && usageEntry?.usage !== undefined
+        ? { usage: usageEntry.usage }
+        : {}),
+      ...(recoveredFailureSignature === undefined
+        ? {}
+        : { failureSignature: recoveredFailureSignature }),
+    };
+    await this.executions.save(input.project.id, completedAttempt);
+    if (verification.overallStatus !== "passed") {
+      await this.stopTask(
+        task,
+        state,
+        verification.overallStatus === "blocked"
+          ? "recovered_verification_blocked"
+          : "recovered_verification_failed",
+      );
+    }
+    ({ task } = await this.transition(
+      task,
+      state,
+      "reviewing",
+      `Recovered passing verification for diff ${diff.diffHash}`,
+      attempt.id,
+    ));
+    return {
+      task,
+      diff,
+      verification,
+      attempts: [completedAttempt],
+      usage: await this.usage.read(input.project.id, input.task.id),
+    };
+  }
+
+  private async readAttemptVerification(
+    projectId: string,
+    taskId: string,
+    executionId: string,
+  ): Promise<VerificationResult | undefined> {
+    try {
+      return await this.verificationRepository.readForExecution(projectId, taskId, executionId);
+    } catch (error) {
+      if (isMissingStateDocument(error)) return undefined;
+      throw error;
+    }
+  }
+
+  private writerRuntimeCheckpointPath(
+    projectId: string,
+    taskId: string,
+    executionId: string,
+  ): string {
+    return join(
+      this.paths.taskDirectory(projectId, taskId),
+      "runs",
+      `${executionId}.writer-runtime-checkpoint.json`,
+    );
   }
 
   private async assertPrimaryUnchanged(
@@ -854,4 +1369,30 @@ function mergeEvidence(items: readonly Evidence[]): Evidence[] {
   const byId = new Map<string, Evidence>();
   for (const item of items) byId.set(item.id, item);
   return [...byId.values()].sort((left, right) => left.id.localeCompare(right.id));
+}
+
+function implementationTaskInput(task: Task): unknown {
+  return {
+    id: task.id,
+    projectId: task.projectId,
+    type: task.type,
+    title: task.title,
+    summary: task.summary,
+    reports: task.reports,
+    constraints: task.constraints,
+    acceptanceCriteria: task.acceptanceCriteria,
+    protectedContracts: task.protectedContracts,
+    assumptions: task.assumptions,
+    unknowns: task.unknowns,
+    requestedScope: task.requestedScope,
+    profile: task.profile,
+  };
+}
+
+function isMissingStateDocument(error: unknown): boolean {
+  return (
+    error instanceof OrchestratorError &&
+    error.code === "CONFIGURATION" &&
+    error.message.startsWith("Unable to read state document at ")
+  );
 }

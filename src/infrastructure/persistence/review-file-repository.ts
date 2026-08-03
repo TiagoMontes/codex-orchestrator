@@ -25,4 +25,11 @@ export class ReviewFileRepository {
       reviewResultSchema,
     );
   }
+
+  readForExecution(projectId: string, taskId: string, executionId: string): Promise<ReviewResult> {
+    return this.store.read(
+      join(this.paths.taskDirectory(projectId, taskId), "runs", `${executionId}.review.json`),
+      reviewResultSchema,
+    );
+  }
 }

@@ -8,6 +8,7 @@ describe("LogRedactor", () => {
       "API_TOKEN=top-secret",
       'payload={"password":"hunter2"}',
       "remote=https://alice:password@example.test/repo.git",
+      "tool --token command-line-secret --api-key=another-secret",
     ].join("\n");
 
     const redacted = new LogRedactor().redact(input);
@@ -16,6 +17,8 @@ describe("LogRedactor", () => {
     expect(redacted).not.toContain("top-secret");
     expect(redacted).not.toContain("hunter2");
     expect(redacted).not.toContain("alice:password");
-    expect(redacted.match(/\[REDACTED\]/gu)?.length).toBeGreaterThanOrEqual(4);
+    expect(redacted).not.toContain("command-line-secret");
+    expect(redacted).not.toContain("another-secret");
+    expect(redacted.match(/\[REDACTED\]/gu)?.length).toBeGreaterThanOrEqual(6);
   });
 });

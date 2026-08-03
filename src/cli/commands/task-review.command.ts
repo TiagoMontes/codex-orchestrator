@@ -7,16 +7,18 @@ import type {
   TaskReviewer,
   TaskReviewOverrides,
 } from "../../application/tasks/task-review-service.js";
+import type { TaskReporter } from "../../application/tasks/task-reporting-service.js";
 import { OrchestratorError } from "../../shared/errors.js";
 import { parseCliValue } from "../validation.js";
 import type { OutputWriter } from "../output.js";
-import { writeResult } from "../output.js";
+import { codexProgressWriter, writeResult } from "../output.js";
 
 export function registerTaskReviewCommand(
   task: Command,
   program: Command,
   reviewer: TaskReviewer,
   output: OutputWriter,
+  reporter?: TaskReporter,
 ): void {
   task
     .command("review")
@@ -32,9 +34,19 @@ export function registerTaskReviewCommand(
     .option("--timeout <duration>")
     .description("Run fresh independent review with bounded correction cycles")
     .action(async (taskId: string, options: Record<string, string | boolean | undefined>) => {
-      const report = await reviewer.review(taskId, parseOverrides(options));
-      if (program.opts<{ json?: boolean }>().json ?? false) {
-        writeResult(output, report, true);
+      const json = program.opts<{ json?: boolean }>().json ?? false;
+      if (!json) output.write("[review] starting fresh independent review thread");
+      const report = await reviewer.review(taskId, {
+        ...parseOverrides(options),
+        ...(json ? {} : { progress: codexProgressWriter(output) }),
+      });
+      const status = await reporter?.status(taskId);
+      if (json) {
+        writeResult(
+          output,
+          status === undefined ? report : { ...report, finalReport: status },
+          true,
+        );
         return;
       }
       const finalReview = report.reviews.at(-1);
@@ -52,7 +64,39 @@ export function registerTaskReviewCommand(
       output.write(
         `Usage: ${report.usage.totals.totalTokens} tokens across ${report.usage.totalCalls} agent call(s)`,
       );
-      output.write(`Next: cxo task inspect ${report.task.id}`);
+      if (status !== undefined) {
+        output.write(`Title: ${status.task.title}`);
+        output.write(`Summary: ${status.task.summary}`);
+        output.write(`Worktree: ${status.task.worktree?.path ?? "none"}`);
+        output.write(
+          `Diagnosis: ${status.artifacts.diagnosis?.status ?? "unavailable"}; ${status.artifacts.diagnosis?.nextAction ?? "no next action recorded"}`,
+        );
+        output.write(
+          `Root causes: ${status.artifacts.diagnosis?.rootCauses.map((cause) => cause.statement).join("; ") || "none confirmed"}`,
+        );
+        output.write(`Changed files: ${status.artifacts.diff?.changedFiles.join(", ") || "none"}`);
+        output.write(
+          `Final report: base ${status.task.baseCommit ?? "not pinned"}; branch ${status.task.worktree?.branch ?? "none"}; retries ${status.retryCount}; context rotations ${status.contextRotations.length}`,
+        );
+        output.write(
+          `Acceptance criteria: ${status.artifacts.review?.acceptanceCriteriaAssessment.map((item) => `${item.criterionId}=${item.status}`).join(", ") || "not assessed"}`,
+        );
+        for (const usage of status.usageBreakdown) {
+          output.write(
+            `Usage ${usage.phase}/${usage.model}: ${usage.totalTokens} tokens in ${usage.calls} call(s)`,
+          );
+        }
+        for (const retry of status.retries) {
+          output.write(`Retry ${retry.phase} #${retry.attemptNumber}: ${retry.reason}`);
+        }
+        for (const rotation of status.contextRotations) {
+          output.write(
+            `Context rotation ${rotation.phase}/${rotation.executionId}: ${rotation.reasons.join("; ") || "policy rotation"}`,
+          );
+        }
+        for (const limitation of status.limitations) output.write(`Limitation: ${limitation}`);
+      }
+      output.write(`Next: ${status?.nextCommand ?? "none (task is complete)"}`);
     });
 }
 

@@ -21,7 +21,7 @@ import { registerTaskCreateCommand } from "./commands/task-create.command.js";
 import { registerTaskQueryCommands } from "./commands/task-query.command.js";
 import type { TaskDiagnosisManager } from "../application/tasks/task-diagnosis-service.js";
 import { TaskDiagnosisService } from "../application/tasks/task-diagnosis-service.js";
-import { CodexSdkRuntime } from "../infrastructure/codex/codex-sdk-runtime.js";
+import { ConfiguredCodexRuntime } from "../infrastructure/codex/configured-codex-runtime.js";
 import type { CodexRuntime } from "../infrastructure/codex/codex-runtime.js";
 import { UsageFileRepository } from "../infrastructure/persistence/usage-file-repository.js";
 import { DiagnosisFileRepository } from "../infrastructure/persistence/diagnosis-file-repository.js";
@@ -86,7 +86,7 @@ export function createProgram(dependencies: ProgramDependencies = {}): Command {
       taskRepository,
       configService.paths,
     );
-  const codexRuntime = dependencies.codexRuntime ?? new CodexSdkRuntime();
+  const codexRuntime = dependencies.codexRuntime ?? new ConfiguredCodexRuntime(configService);
   const usageRepository = new UsageFileRepository(configService.paths);
   const executionRepository = new ExecutionFileRepository(configService.paths);
   const decisionRepository = new DecisionFileRepository(configService.paths);
@@ -158,6 +158,7 @@ export function createProgram(dependencies: ProgramDependencies = {}): Command {
       verificationRepository,
       reviewRepository,
       decisionRepository,
+      projectService,
     );
   const taskController =
     dependencies.taskController ??
@@ -181,6 +182,7 @@ export function createProgram(dependencies: ProgramDependencies = {}): Command {
       taskRepository,
       executionRepository,
       taskWorktreeService,
+      usageRepository,
     );
   const taskRunService =
     dependencies.taskRunService ??
@@ -252,7 +254,7 @@ export function createProgram(dependencies: ProgramDependencies = {}): Command {
   registerTaskQueryCommands(task, program, taskService, configService, output, taskReporter);
   registerTaskDiagnoseCommand(task, program, taskDiagnosisService, output);
   registerTaskRunCommand(task, program, taskRunService, output);
-  registerTaskReviewCommand(task, program, taskReviewService, output);
+  registerTaskReviewCommand(task, program, taskReviewService, output, taskReporter);
   registerTaskOperationCommands(
     task,
     program,

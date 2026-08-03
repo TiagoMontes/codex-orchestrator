@@ -4,7 +4,7 @@ import type { ConfigService } from "../../application/configuration/config-servi
 import type { ProjectManager } from "../../application/projects/project-service.js";
 import type { Project } from "../../domain/project/project.js";
 import type { OutputWriter } from "../output.js";
-import { writeResult } from "../output.js";
+import { codexProgressWriter, writeResult } from "../output.js";
 import type {
   ProjectAuditOverrides,
   ProjectAuditor,
@@ -104,8 +104,13 @@ export function registerProjectCommands(
       .option("--timeout <duration>")
       .description("Generate five commit-scoped, evidenced repository knowledge artifacts")
       .action(async (reference: string, options: Record<string, string | boolean | undefined>) => {
-        const report = await auditor.audit(reference, parseAuditOverrides(options));
-        if (isJson(program)) {
+        const json = isJson(program);
+        if (!json) output.write("[audit] starting commit-scoped repository audit");
+        const report = await auditor.audit(reference, {
+          ...parseAuditOverrides(options),
+          ...(json ? {} : { progress: codexProgressWriter(output) }),
+        });
+        if (json) {
           writeResult(output, report, true);
           return;
         }

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -24,12 +24,15 @@ afterEach(async () => {
 });
 
 describe("task cancellation and resume", () => {
-  it("aborts an active writer, preserves cancellation, releases budget, and resumes safely", async () => {
+  it("aborts an active writer, charges its reservation, and resumes safely", async () => {
     const repositoryRoot = await mkdtemp(join(tmpdir(), "cxo-control-repo-"));
     const stateHome = await mkdtemp(join(tmpdir(), "cxo-control-state-"));
     temporaryDirectories.push(repositoryRoot, stateHome);
     await createGitFixture(repositoryRoot);
     const seeded = await createDiagnosedTaskFixture(repositoryRoot, stateHome);
+    await writeFile(join(repositoryRoot, "primary-note.md"), "Primary branch advanced.\n", "utf8");
+    await gitOutput(repositoryRoot, ["add", "primary-note.md"]);
+    await gitOutput(repositoryRoot, ["commit", "-m", "advance primary after diagnosis"]);
     const primaryHead = await gitOutput(repositoryRoot, ["rev-parse", "HEAD"]);
     const primaryStatus = await gitOutput(repositoryRoot, ["status", "--porcelain=v1"]);
     let runtimeStarted!: () => void;
@@ -102,16 +105,17 @@ describe("task cancellation and resume", () => {
       "cancelled",
     );
     expect((await usage.read(seeded.project.id, seeded.task.id)).reservations).toEqual([]);
+    expect((await usage.read(seeded.project.id, seeded.task.id)).totalCalls).toBeGreaterThan(0);
     expect(await gitOutput(repositoryRoot, ["rev-parse", "HEAD"])).toBe(primaryHead);
     expect(await gitOutput(repositoryRoot, ["status", "--porcelain=v1"])).toBe(primaryStatus);
 
-    await usage.reserve({
+    const orphanReservation = await usage.reserve({
       projectId: seeded.project.id,
       taskId: seeded.task.id,
       phase: "implementation",
       projectedTokens: 100,
-      maxTotalTokens: 10_000,
-      maxAgentCalls: 10,
+      maxTotalTokens: 1_000_000,
+      maxAgentCalls: 100,
     });
     const priorAttempt = (await executions.list(seeded.project.id, seeded.task.id))[0];
     expect(priorAttempt).toBeDefined();
@@ -124,6 +128,7 @@ describe("task cancellation and resume", () => {
       await executions.save(seeded.project.id, {
         ...interrupted,
         id: randomUUID(),
+        reservationId: orphanReservation.id,
         startedAt: "2026-08-02T12:09:00.000Z",
         status: "running",
       });
